@@ -116,8 +116,21 @@ python server.py -k "sk-xxx" -m "gpt-4o" -b "https://api.openai.com/v1"
 ├── start.bat              # Windows startup script
 ├── settings-example.json  # Claude Code settings example
 ├── requirements.txt
+├── package.json           # npm package for global installation
+├── ccf.js                 # CLI entry point
 └── README.md
 ```
+
+## Install as Global CLI
+
+```bash
+npm install -g claudecode-fix
+
+# Then run:
+ccf
+```
+
+This installs the `ccf` command globally and opens the project page in browser.
 
 ## API Endpoints
 

@@ -114,8 +114,21 @@ python server.py -k "sk-xxx" -m "gpt-4o" -b "https://api.openai.com/v1"
 ├── start.bat          # Windows 启动脚本
 ├── settings-example.json  # Claude Code 设置示例
 ├── requirements.txt
+├── package.json       # npm 全局安装包
+├── ccf.js             # CLI 入口
 └── README.md
 ```
+
+## 全局安装 CLI
+
+```bash
+npm install -g claudecode-fix
+
+# 然后运行：
+ccf
+```
+
+这会在全局安装 `ccf` 命令并自动在浏览器打开项目页面。
 
 ## API 端点
 
