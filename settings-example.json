@@ -1,0 +1,24 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://0.0.0.0:8080",
+    "ANTHROPIC_AUTH_TOKEN": "123",
+    "API_TIMEOUT_MS": "3000000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "ENABLE_TOOL_SEARCH": "true",
+    "ANTHROPIC_MODEL": "mimo-v2.5[1m]"
+  },
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "permissions": {
+    "allow": [
+      "mcp__pencil"
+    ]
+  },
+  "model": "opus-4.8[1m]",
+  "skipDangerousModePermissionPrompt": true,
+  "theme": "dark",
+  "ANTHROPIC_BASE_URL": "http://0.0.0.0:8080",
+  "ANTHROPIC_AUTH_TOKEN": "123"
+}

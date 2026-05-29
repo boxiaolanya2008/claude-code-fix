@@ -19,9 +19,13 @@ from typing import AsyncGenerator
 
 import httpx
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+
+# 加载 .env 文件
+load_dotenv()
 
 from converter import convert_request, convert_response, convert_stream
 
@@ -54,6 +58,8 @@ class TargetConfig:
     api_key: str   = _field(default_factory=lambda: _env("TARGET_API_KEY"))
     api_base: str  = _field(default_factory=lambda: _env("TARGET_API_BASE", "https://api.openai.com/v1"))
     model: str     = _field(default_factory=lambda: _env("TARGET_MODEL", "gpt-4o"))
+    disguise_model: str = _field(default_factory=lambda: _env("DISGUISE_MODEL"))
+    disguise_api_base: str = _field(default_factory=lambda: _env("DISGUISE_API_BASE", "https://api.anthropic.com"))
     max_retries: int = _field(default_factory=lambda: int(_env("TARGET_MAX_RETRIES", "2")))
     timeout: float = _field(default_factory=lambda: float(_env("TARGET_TIMEOUT", "300")))
 
@@ -126,8 +132,8 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
     )
     logger.info(
-        "Proxy ready  %s:%s  →  %s  model=%s",
-        proxy_cfg.host, proxy_cfg.port, target_cfg.api_base, target_cfg.model,
+        "Proxy ready  %s:%s  →  %s  model=%s  disguise=%s",
+        proxy_cfg.host, proxy_cfg.port, target_cfg.api_base, target_cfg.model, target_cfg.disguise_model,
     )
     yield
     await http_client.aclose()
@@ -189,7 +195,15 @@ async def handle_messages(request: Request):
 
     req_id = f"msg_{uuid.uuid4().hex[:24]}"
     stream = body.get("stream", False)
+
+    # Debug: log original request
+    import json as _json
+    logger.debug("[%s] RAW BODY: %s", req_id[:12], _json.dumps(body, ensure_ascii=False)[:2000])
+
     oa_body = convert_request(body, target_cfg.model)
+
+    # Debug: log converted request
+    logger.debug("[%s] OA BODY: %s", req_id[:12], _json.dumps(oa_body, ensure_ascii=False)[:2000])
     oa_body.setdefault("stream", stream)
 
     headers = {
@@ -201,10 +215,11 @@ async def handle_messages(request: Request):
         headers["anthropic-version"] = v
 
     logger.info(
-        "[%s] %s → %s  (stream=%s)",
+        "[%s] %s → %s  disguise=%s  (stream=%s)",
         req_id[:12],
         body.get("model", "?"),
         target_cfg.model,
+        target_cfg.disguise_model,
         stream,
     )
 
@@ -241,8 +256,11 @@ async def _handle_non_stream(req_id: str, oa_body: dict, headers: dict) -> Respo
     except Exception:
         return _upstream_error("Invalid JSON from upstream")
 
-    anthropic_resp = convert_response(oa_resp, target_cfg.model, request_id=req_id)
-    return JSONResponse(anthropic_resp)
+    anthropic_resp = convert_response(oa_resp, target_cfg.disguise_model, request_id=req_id)
+    return JSONResponse(anthropic_resp, headers={
+        "x-request-id": req_id,
+        "anthropic-version": "2023-06-01",
+    })
 
 
 # ---- streaming -----------------------------------------------------------
@@ -277,7 +295,7 @@ async def _handle_stream(req_id: str, oa_body: dict, headers: dict) -> Streaming
                 async for line in upstream_resp.aiter_lines():
                     yield line
 
-            async for event in convert_stream(raw_lines(), target_cfg.model, request_id=req_id):
+            async for event in convert_stream(raw_lines(), target_cfg.disguise_model, request_id=req_id):
                 yield event
         finally:
             await upstream_resp.aclose()
@@ -289,6 +307,8 @@ async def _handle_stream(req_id: str, oa_body: dict, headers: dict) -> Streaming
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            "x-request-id": req_id,
+            "anthropic-version": "2023-06-01",
         },
     )
 
@@ -302,7 +322,7 @@ async def handle_models():
     return {
         "data": [
             {
-                "id": target_cfg.model,
+                "id": target_cfg.disguise_model,
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "proxy",
@@ -323,7 +343,7 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "proxy": "claude-code-proxy", "target": target_cfg.model}
+    return {"status": "ok", "proxy": "claude-code-proxy", "model": target_cfg.disguise_model, "api": target_cfg.disguise_api_base}
 
 
 # ---------------------------------------------------------------------------

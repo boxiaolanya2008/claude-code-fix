@@ -43,23 +43,22 @@ def convert_request(data: dict, target_model: str) -> dict:
     messages: list[dict] = []
 
     # --- system prompt -------------------------------------------------
+    system_text = ""
     system = data.get("system")
     if system:
-        # system can be a string or a list of content blocks
         if isinstance(system, list):
-            text = "\n".join(b.get("text", "") for b in system if b.get("type") == "text")
+            system_text = "\n".join(b.get("text", "") for b in system if b.get("type") == "text")
         else:
-            text = str(system)
-        if text:
-            messages.append({"role": "system", "content": text})
+            system_text = str(system)
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
 
     # --- messages ------------------------------------------------------
     for msg in data.get("messages", []):
         role = msg["role"]
         content = msg.get("content")
 
-        # Skip system messages anywhere in the array — OpenAI only allows
-        # role:"system" at index 0, which we already handled above.
+        # Skip all system role messages — will be re-inserted at index 0
         if role == "system":
             continue
 
@@ -113,28 +112,25 @@ def convert_request(data: dict, target_model: str) -> dict:
                 })
 
         # --- Emit in correct order --------------------------------------
-        # For assistant messages: emit ONE message with text + tool_calls
         if role == "assistant":
+            # One assistant message: text + tool_calls merged
             assistant_msg: dict[str, Any] = {"role": "assistant"}
             if text_parts:
                 assistant_msg["content"] = "\n".join(text_parts)
-            # Many OpenAI-compat APIs reject content:null — omit the field entirely
             if tool_calls_oa:
                 assistant_msg["tool_calls"] = tool_calls_oa
             messages.append(assistant_msg)
-
         else:
-            # For user messages: emit text first, then tool results as role=tool
+            # User: text first, then tool results
             if text_parts:
                 messages.append({"role": "user", "content": "\n".join(text_parts)})
             for tr in tool_results_oa:
                 messages.append(tr)
 
-    # --- Sanitize: ensure no system role after index 0 ------------------
-    if messages and messages[0].get("role") == "system":
-        messages = [messages[0]] + [m for m in messages[1:] if m.get("role") != "system"]
-    else:
-        messages = [m for m in messages if m.get("role") != "system"]
+    # --- Sanitize: strip ALL system role, re-add at index 0 -------------
+    messages = [m for m in messages if m.get("role") != "system"]
+    if system_text:
+        messages.insert(0, {"role": "system", "content": system_text})
 
     # --- tools ---------------------------------------------------------
     tools_oa: list[dict] | None = None
@@ -243,19 +239,11 @@ async def convert_stream(
 ) -> AsyncGenerator[str, None]:
     """Yield Anthropic SSE event lines from an OpenAI SSE stream."""
     msg_id = request_id or _gen_id()
-    started = False
-    block_index = 0
-    current_tool_index: int | None = None
-    # Track whether we've emitted content_block_start for the current tool
-    tool_started: dict[int, bool] = {}
-    finished = False
-    output_tokens = 0
 
     def _emit(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     # ---- message_start ----
-    started = True
     yield _emit("message_start", {
         "type": "message_start",
         "message": {
@@ -270,7 +258,11 @@ async def convert_stream(
         },
     })
 
-    content_block_started = False
+    # Track open content blocks: None = no block open, "text" = text block open,
+    # int ≥ 1 = tool block index open
+    open_index: int | None = None
+    finished = False
+    output_tokens = 0
 
     async for raw_line in oa_stream:
         line = raw_line.rstrip("\n")
@@ -285,15 +277,18 @@ async def convert_stream(
         except json.JSONDecodeError:
             continue
 
-        choice = (chunk.get("choices") or [{}])[0]
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
         delta = choice.get("delta", {})
         finish_reason = choice.get("finish_reason")
 
         # --- text content ------------------------------------------------
         text_delta = delta.get("content")
         if text_delta:
-            if not content_block_started:
-                content_block_started = True
+            if open_index is None:
+                open_index = 0
                 yield _emit("content_block_start", {
                     "type": "content_block_start",
                     "index": 0,
@@ -306,58 +301,45 @@ async def convert_stream(
             })
 
         # --- tool calls ---------------------------------------------------
-        for tc_delta in delta.get("tool_calls", []):
+        for tc_delta in (delta.get("tool_calls") or []):
             tc_idx = tc_delta.get("index", 0)
-            anthropic_idx = tc_idx + 1  # index 0 is reserved for text block
+            func = tc_delta.get("function") or {}
 
-            # Start of a new tool call
-            if "id" in tc_delta or "function" in tc_delta:
-                func = tc_delta.get("function", {})
-                if "id" in tc_delta and not tool_started.get(tc_idx):
-                    tool_started[tc_idx] = True
-                    # Close text block if it was open
-                    if content_block_started:
-                        yield _emit("content_block_stop", {"type": "content_block_stop", "index": 0})
-                        content_block_started = False
+            if "id" in tc_delta:
+                anthropic_idx = tc_idx + 1
+                # Close any open block before starting tool block
+                if open_index is not None:
+                    yield _emit("content_block_stop", {"type": "content_block_stop", "index": open_index})
+                open_index = anthropic_idx
+                yield _emit("content_block_start", {
+                    "type": "content_block_start",
+                    "index": anthropic_idx,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tc_delta["id"],
+                        "name": func.get("name", ""),
+                        "input": {},
+                    },
+                })
 
-                    yield _emit("content_block_start", {
-                        "type": "content_block_start",
-                        "index": anthropic_idx,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tc_delta["id"],
-                            "name": func.get("name", ""),
-                            "input": {},
-                        },
-                    })
-
-                # Stream arguments
-                args = func.get("arguments", "")
-                if args:
-                    yield _emit("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": anthropic_idx,
-                        "delta": {"type": "input_json_delta", "partial_json": args},
-                    })
+            args = func.get("arguments", "")
+            if args:
+                if open_index is None:
+                    open_index = tc_idx + 1
+                yield _emit("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": open_index,
+                    "delta": {"type": "input_json_delta", "partial_json": args},
+                })
 
         # --- finish_reason ------------------------------------------------
         if finish_reason and not finished:
             finished = True
-            # Close any open content block
-            if content_block_started:
-                yield _emit("content_block_stop", {"type": "content_block_stop", "index": 0})
-                content_block_started = False
+            if open_index is not None:
+                yield _emit("content_block_stop", {"type": "content_block_stop", "index": open_index})
+                open_index = None
 
-            # Close any open tool blocks
-            for tidx in sorted(tool_started.keys()):
-                if tool_started[tidx]:
-                    yield _emit("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": tidx + 1,
-                    })
-
-            # Usage
-            oa_usage = chunk.get("usage", {})
+            oa_usage = chunk.get("usage") or {}
             output_tokens = oa_usage.get("completion_tokens", 0) or output_tokens
 
             yield _emit("message_delta", {
@@ -369,9 +351,9 @@ async def convert_stream(
                 "usage": {"output_tokens": output_tokens},
             })
 
-    # --- cleanup: close any unclosed text block ---
-    if content_block_started:
-        yield _emit("content_block_stop", {"type": "content_block_stop", "index": 0})
+    # --- cleanup -------------------------------------------------------
+    if open_index is not None:
+        yield _emit("content_block_stop", {"type": "content_block_stop", "index": open_index})
 
     if not finished:
         yield _emit("message_delta", {

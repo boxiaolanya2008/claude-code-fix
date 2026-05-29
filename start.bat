@@ -1,8 +1,1 @@
-@echo off
-REM ==============================================================================
-REM Claude Code Proxy — Windows 一键启动
-REM 用法: start.bat -k "sk-xxx" -m "deepseek-chat" -b "https://api.deepseek.com/v1"
-REM ==============================================================================
-
-python "%~dp0server.py" %*
-pause
+C:\Users\31702\AppData\Local\Python\pythoncore-3.14-64\python.exe D:\31702\claude-code-fix\server.py
