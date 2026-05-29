@@ -1,0 +1,28 @@
+{
+  "name": "claudecode-fix",
+  "version": "1.0.1",
+  "description": "Fix Claude Code 400 error when using third-party models",
+  "main": "index.js",
+  "bin": {
+    "ccf": "./ccf.js"
+  },
+  "scripts": {
+    "postinstall": "node index.js"
+  },
+  "keywords": [
+    "claudecode",
+    "claude",
+    "proxy",
+    "openai",
+    "api"
+  ],
+  "author": "boxiaolanya2008",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/boxiaolanya2008/claude-code-fix.git"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

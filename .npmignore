@@ -1,0 +1,5 @@
+# Keep only npm-related files
+*
+!index.js
+!package.json
+!.npmignore

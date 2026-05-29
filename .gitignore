@@ -6,4 +6,4 @@ dist/
 build/
 .venv/
 venv/
-start.bat
+node_modules/
