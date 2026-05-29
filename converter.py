@@ -34,6 +34,27 @@ def _stop_reason_map(reason: str | None) -> str:
     }.get(reason or "", "end_turn")
 
 
+def _parse_image_source(src: dict) -> dict:
+    """Parse Anthropic image source to OpenAI image_url format."""
+    media_type = src.get("media_type", "image/jpeg")
+    img_type = src.get("type", "")
+
+    if img_type == "base64":
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{media_type};base64,{src.get('data', '')}"
+            }
+        }
+    else:
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": src.get("url", "")
+            }
+        }
+
+
 # ---------------------------------------------------------------------------
 # Request  (Anthropic → OpenAI)
 # ---------------------------------------------------------------------------
@@ -73,7 +94,7 @@ def convert_request(data: dict, target_model: str) -> dict:
             continue
 
         # --- Anthropic content-block list --------------------------------
-        text_parts: list[str] = []
+        content_parts: list[dict] = []
         tool_calls_oa: list[dict] = []
         tool_results_oa: list[dict] = []
 
@@ -81,15 +102,14 @@ def convert_request(data: dict, target_model: str) -> dict:
             btype = block.get("type", "")
 
             if btype == "text":
-                text_parts.append(block.get("text", ""))
+                text = block.get("text", "")
+                if text:
+                    content_parts.append({"type": "text", "text": text})
 
             elif btype == "image":
-                src = block.get("source", {})
-                if src.get("type") == "base64":
-                    url = f"data:{src.get('media_type', 'image/jpeg')};base64,{src.get('data', '')}"
-                else:
-                    url = src.get("url", "")
-                text_parts.append(f"[Image: {url}]")
+                # Convert to OpenAI image_url format
+                image_part = _parse_image_source(block.get("source", {}))
+                content_parts.append(image_part)
 
             elif btype == "tool_use":
                 tool_calls_oa.append({
@@ -115,15 +135,23 @@ def convert_request(data: dict, target_model: str) -> dict:
         if role == "assistant":
             # One assistant message: text + tool_calls merged
             assistant_msg: dict[str, Any] = {"role": "assistant"}
-            if text_parts:
-                assistant_msg["content"] = "\n".join(text_parts)
+            if content_parts:
+                # If only text, use simple string format
+                if len(content_parts) == 1 and content_parts[0]["type"] == "text":
+                    assistant_msg["content"] = content_parts[0]["text"]
+                else:
+                    assistant_msg["content"] = content_parts
             if tool_calls_oa:
                 assistant_msg["tool_calls"] = tool_calls_oa
             messages.append(assistant_msg)
         else:
-            # User: text first, then tool results
-            if text_parts:
-                messages.append({"role": "user", "content": "\n".join(text_parts)})
+            # User: content parts (text + images) first, then tool results
+            if content_parts:
+                # If only one part (text only), use simple string format
+                if len(content_parts) == 1 and content_parts[0]["type"] == "text":
+                    messages.append({"role": "user", "content": content_parts[0]["text"]})
+                else:
+                    messages.append({"role": "user", "content": content_parts})
             for tr in tool_results_oa:
                 messages.append(tr)
 
@@ -190,9 +218,20 @@ def convert_response(oa_resp: dict, model: str, request_id: str | None = None) -
     # --- content blocks ------------------------------------------------
     content: list[dict] = []
 
-    text = oa_msg.get("content")
-    if text:
-        content.append({"type": "text", "text": text})
+    raw_content = oa_msg.get("content", "")
+    if isinstance(raw_content, str):
+        if raw_content:
+            content.append({"type": "text", "text": raw_content})
+    elif isinstance(raw_content, list):
+        for part in raw_content:
+            if part.get("type") == "text":
+                text = part.get("text", "")
+                if text:
+                    content.append({"type": "text", "text": text})
+            elif part.get("type") == "image_url":
+                # OpenAI might return image content in response (rare)
+                url_data = part.get("image_url", {}).get("url", "")
+                content.append({"type": "text", "text": f"[Image response: {url_data[:50]}...]"})
 
     for tc in oa_msg.get("tool_calls", []):
         args = tc.get("function", {}).get("arguments", "{}")
@@ -285,20 +324,33 @@ async def convert_stream(
         finish_reason = choice.get("finish_reason")
 
         # --- text content ------------------------------------------------
-        text_delta = delta.get("content")
-        if text_delta:
-            if open_index is None:
-                open_index = 0
-                yield _emit("content_block_start", {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                })
-            yield _emit("content_block_delta", {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "text_delta", "text": text_delta},
-            })
+        raw_content = delta.get("content")
+        if raw_content:
+            # Handle both string and list formats
+            if isinstance(raw_content, str):
+                text_parts = [raw_content]
+            else:
+                text_parts = []
+                if isinstance(raw_content, list):
+                    for part in raw_content:
+                        if part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                        # Skip image_url in streaming (rare case)
+
+            for text_delta in text_parts:
+                if text_delta:
+                    if open_index is None:
+                        open_index = 0
+                        yield _emit("content_block_start", {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                    yield _emit("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": text_delta},
+                    })
 
         # --- tool calls ---------------------------------------------------
         for tc_delta in (delta.get("tool_calls") or []):
