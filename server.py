@@ -12,8 +12,10 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -27,7 +29,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # 加载 .env 文件
 load_dotenv()
 
-from converter import convert_request, convert_response
+from converter import convert_request, convert_response, convert_stream
 
 # ---------------------------------------------------------------------------
 # CLI arguments
@@ -44,10 +46,10 @@ def _parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
-# Config dataclasses
+# Config dataclasses (lightweight — avoid extra import for CLI override)
 # ---------------------------------------------------------------------------
 
-from dataclasses import dataclass, field as _field
+from dataclasses import dataclass, field as _field  # noqa: E402
 
 def _env(key: str, default: str = "") -> str:
     return os.getenv(key, default).strip()
@@ -62,7 +64,6 @@ class TargetConfig:
     disguise_api_base: str = _field(default_factory=lambda: _env("DISGUISE_API_BASE", "https://api.anthropic.com"))
     max_retries: int = _field(default_factory=lambda: int(_env("TARGET_MAX_RETRIES", "2")))
     timeout: float = _field(default_factory=lambda: float(_env("TARGET_TIMEOUT", "300")))
-    warm_connections: int = _field(default_factory=lambda: int(_env("WARM_CONNECTIONS", "3")))
 
     @property
     def chat_url(self) -> str:
@@ -87,6 +88,7 @@ class ProxyConfig:
 
 def _load_config(args: argparse.Namespace) -> tuple[TargetConfig, ProxyConfig]:
     """Build configs from .env, then override with CLI arguments."""
+    # Target — start from env, override with CLI
     t = TargetConfig(
         api_key=args.api_key  or _env("TARGET_API_KEY"),
         api_base=args.api_base or _env("TARGET_API_BASE", "https://api.openai.com/v1"),
@@ -94,6 +96,7 @@ def _load_config(args: argparse.Namespace) -> tuple[TargetConfig, ProxyConfig]:
     )
     t.validate()
 
+    # Proxy — start from env, override with CLI
     p = ProxyConfig(
         host=args.host or _env("PROXY_HOST", "0.0.0.0"),
         port=args.port or int(_env("PROXY_PORT", "8080")),
@@ -112,89 +115,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("proxy")
 
-
-# ---------------------------------------------------------------------------
-# Connection Pool Manager - 预热连接池
-# ---------------------------------------------------------------------------
-
-class ConnectionPool:
-    """预热连接池：保持多个预建连接，复用减少首字延迟"""
-
-    def __init__(self, config: TargetConfig):
-        self.config = config
-        self._pool: asyncio.Queue = asyncio.Queue()
-        self._lock = asyncio.Lock()
-        self._http_client: httpx.AsyncClient | None = None
-        self._warming = False
-
-    async def init(self, http_client: httpx.AsyncClient):
-        """初始化：创建 http_client 并预热连接"""
-        self._http_client = http_client
-        await self._warm_pool(self.config.warm_connections)
-
-    async def _warm_pool(self, count: int):
-        """预热指定数量的连接"""
-        logger.info(f"预热 {count} 个连接...")
-        tasks = [self._create_warm_connection() for _ in range(count)]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info(f"连接预热完成，池中可用连接: {self._pool.qsize()}")
-
-    async def _create_warm_connection(self):
-        """创建一个预热连接并放入池中"""
-        try:
-            # 发送一个极简请求预热连接（不关心响应）
-            warm_request = {
-                "model": self.config.model,
-                "messages": [{"role": "user", "content": "."}],
-                "max_tokens": 1,
-                "stream": True,
-            }
-            headers = {
-                "Authorization": f"Bearer {self.config.api_key}",
-                "Content-Type": "application/json",
-            }
-            req = self._http_client.build_request(
-                "POST", self.config.chat_url, json=warm_request, headers=headers
-            )
-            resp = await self._http_client.send(req, stream=True)
-            # 立即关闭，不等待完整响应（只是预热 TCP+TLS）
-            await resp.aclose()
-            await self._pool.put(True)  # 占位，表示连接就绪
-            logger.debug("连接预热成功")
-        except Exception as e:
-            logger.debug(f"预热连接失败: {e}")
-
-    async def get_connection(self) -> bool:
-        """获取一个预热连接（从池中取）"""
-        try:
-            item = self._pool.get_nowait()
-            return item
-        except asyncio.QueueEmpty:
-            return False
-
-    async def release_and_refill(self):
-        """归还连接后异步补充新连接"""
-        if not self._warming:
-            self._warming = True
-            asyncio.create_task(self._refill())
-            self._warming = False
-
-    async def _refill(self):
-        """异步补充连接池"""
-        try:
-            await asyncio.sleep(0.1)  # 短暂延迟，避免过度占用
-            await self._create_warm_connection()
-        except Exception:
-            pass
-
-    async def warm_up(self):
-        """主动触发连接池预热（可在响应后调用）"""
-        if self._pool.qsize() < self.config.warm_connections:
-            asyncio.create_task(self._warm_pool(
-                self.config.warm_connections - self._pool.qsize()
-            ))
-
-
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
@@ -202,32 +122,30 @@ class ConnectionPool:
 target_cfg: TargetConfig
 proxy_cfg: ProxyConfig
 http_client: httpx.AsyncClient
-conn_pool: ConnectionPool
+
+# 多线程接收 token 的线程池
+token_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="token-receiver")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global target_cfg, proxy_cfg, http_client, conn_pool
+    global target_cfg, proxy_cfg, http_client
     args = _parse_args()
     target_cfg, proxy_cfg = _load_config(args)
-
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(target_cfg.timeout, connect=10),
         limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+        verify=False,
     )
-
-    # 初始化连接池并预热
-    conn_pool = ConnectionPool(target_cfg)
-    await conn_pool.init(http_client)
-
     logger.info(
-        "Proxy ready  %s:%s  →  %s  model=%s  disguise=%s  warm_conn=%d",
-        proxy_cfg.host, proxy_cfg.port, target_cfg.api_base, target_cfg.model,
-        target_cfg.disguise_model, target_cfg.warm_connections,
+        "Proxy ready  %s:%s  →  %s  model=%s  disguise=%s",
+        proxy_cfg.host, proxy_cfg.port, target_cfg.api_base, target_cfg.model, target_cfg.disguise_model,
     )
     yield
-
     await http_client.aclose()
+    # 关闭线程池，等待所有线程完成
+    token_executor.shutdown(wait=True)
+    logger.info("Token receiver thread pool shut down")
 
 
 # ---------------------------------------------------------------------------
@@ -287,11 +205,13 @@ async def handle_messages(request: Request):
     req_id = f"msg_{uuid.uuid4().hex[:24]}"
     stream = body.get("stream", False)
 
+    # Debug: log original request
     import json as _json
     logger.debug("[%s] RAW BODY: %s", req_id[:12], _json.dumps(body, ensure_ascii=False)[:2000])
 
     oa_body = convert_request(body, target_cfg.model)
 
+    # Debug: log converted request
     logger.debug("[%s] OA BODY: %s", req_id[:12], _json.dumps(oa_body, ensure_ascii=False)[:2000])
     oa_body.setdefault("stream", stream)
 
@@ -299,9 +219,11 @@ async def handle_messages(request: Request):
         "Authorization": f"Bearer {target_cfg.api_key}",
         "Content-Type": "application/json",
     }
+    # Forward anthropic-version if present (some SDKs check it)
     if v := request.headers.get("anthropic-version"):
         headers["anthropic-version"] = v
 
+        verify=False,
     logger.info(
         "[%s] %s → %s  disguise=%s  (stream=%s)",
         req_id[:12],
@@ -345,10 +267,6 @@ async def _handle_non_stream(req_id: str, oa_body: dict, headers: dict) -> Respo
         return _upstream_error("Invalid JSON from upstream")
 
     anthropic_resp = convert_response(oa_resp, target_cfg.disguise_model, request_id=req_id)
-
-    # 响应完成后异步补充连接池
-    asyncio.create_task(conn_pool.warm_up())
-
     return JSONResponse(anthropic_resp, headers={
         "x-request-id": req_id,
         "anthropic-version": "2023-06-01",
@@ -358,40 +276,103 @@ async def _handle_non_stream(req_id: str, oa_body: dict, headers: dict) -> Respo
 # ---- streaming -----------------------------------------------------------
 
 async def _handle_stream(req_id: str, oa_body: dict, headers: dict) -> StreamingResponse:
-    try:
-        req = http_client.build_request("POST", target_cfg.chat_url, json=oa_body, headers=headers)
-        upstream_resp = await http_client.send(req, stream=True)
-    except httpx.HTTPError as exc:
-        logger.error("[%s] upstream stream error: %s", req_id[:12], exc)
-        return _upstream_error(str(exc))
+    # 在线程中使用同步 httpx.Client 发送流式请求
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    loop = asyncio.get_event_loop()
 
-    if upstream_resp.status_code != 200:
-        body_text = await upstream_resp.aread()
-        await upstream_resp.aclose()
-        logger.warning("[%s] upstream %d: %s", req_id[:12], upstream_resp.status_code, body_text[:300])
-        return JSONResponse(
-            {
-                "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": f"Upstream returned {upstream_resp.status_code}: {body_text[:500].decode(errors='replace')}",
-                },
-            },
-            min(upstream_resp.status_code, 500),
+    def read_upstream():
+        """在线程中用同步 Client 读取上游数据，完成后自动废弃线程"""
+        sync_client = httpx.Client(
+            timeout=httpx.Timeout(target_cfg.timeout, connect=10),
+            verify=False,
         )
-
-    # 流结束后补充连接池
-    async def sse_generator() -> AsyncGenerator[str, None]:
         try:
-            async for raw_bytes in upstream_resp.aiter_bytes():
-                text = raw_bytes.decode(errors="replace")
-                if text.startswith("data: "):
-                    yield text
-                elif text.strip() == "data: [DONE]":
-                    yield "data: [DONE]\n\n"
+            with sync_client.stream(
+                "POST", target_cfg.chat_url, json=oa_body, headers=headers,
+            ) as resp:
+                if resp.status_code != 200:
+                    body_text = resp.read().decode(errors="replace")[:500]
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait,
+                        f"__ERROR__{resp.status_code}__{body_text}",
+                    )
+                    return
+                for line in resp.iter_lines():
+                    if line:
+                        loop.call_soon_threadsafe(queue.put_nowait, line)
+        except Exception as e:
+            logger.error("[%s] thread read error: %s", req_id[:12], e)
+            loop.call_soon_threadsafe(
+                queue.put_nowait, f"__EXCEPTION__{e}",
+            )
         finally:
-            await upstream_resp.aclose()
-            asyncio.create_task(conn_pool.warm_up())
+            sync_client.close()
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+            logger.debug("[%s] token receiver thread exiting", req_id[:12])
+
+    future = token_executor.submit(read_upstream)
+
+    async def sse_generator() -> AsyncGenerator[str, None]:
+        def _sse(event: str, data: dict) -> str:
+            return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        def _is_error(line: str) -> str | None:
+            """检测线程错误标记，返回错误消息或 None"""
+            if line.startswith("__ERROR__"):
+                parts = line.split("__", 2)
+                status_code = int(parts[1])
+                body_text = parts[2] if len(parts) > 2 else ""
+                return f"Upstream {status_code}: {body_text[:300]}"
+            if line.startswith("__EXCEPTION__"):
+                return line[len("__EXCEPTION__"):]
+            return None
+
+        try:
+            async def raw_upstream_lines() -> AsyncGenerator[str, None]:
+                while True:
+                    line = await queue.get()
+                    if line is None:
+                        break
+                    yield line
+
+            first_line = None
+            async for line in raw_upstream_lines():
+                first_line = line
+                break
+
+            if first_line is None:
+                yield _sse("error", {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": "Upstream returned empty response"},
+                })
+                return
+
+            error_msg = _is_error(first_line)
+            if error_msg:
+                if first_line.startswith("__ERROR__"):
+                    logger.warning("[%s] %s", req_id[:12], error_msg)
+                else:
+                    logger.error("[%s] %s", req_id[:12], error_msg)
+                yield _sse("error", {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": error_msg},
+                })
+                return
+
+            # 正常流 — 回放 first_line 后继续
+            async def replay() -> AsyncGenerator[str, None]:
+                yield first_line
+                async for line in raw_upstream_lines():
+                    yield line
+
+            async for event in convert_stream(replay(), target_cfg.disguise_model, request_id=req_id):
+                yield event
+        finally:
+            try:
+                future.result(timeout=5)
+            except Exception:
+                pass
+            logger.debug("[%s] token receiver thread completed and discarded", req_id[:12])
 
     return StreamingResponse(
         sse_generator(),
@@ -407,7 +388,7 @@ async def _handle_stream(req_id: str, oa_body: dict, headers: dict) -> Streaming
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/models
+# GET /v1/models  (for compatibility)
 # ---------------------------------------------------------------------------
 
 @app.get("/v1/models")
