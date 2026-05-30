@@ -222,7 +222,7 @@ def convert_response(oa_resp, model, request_id=None):
                 content.append({"type": "text", "text": f"[Image response: {url_data[:50]}...]"})
 
     # tool_calls
-    for tc in oa_msg.get("tool_calls", []):
+    for tc in (oa_msg.get("tool_calls") or []):
         args = tc.get("function", {}).get("arguments", "{}")
         try:
             parsed = json.loads(args)

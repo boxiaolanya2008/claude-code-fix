@@ -8,3 +8,5 @@ build/
 venv/
 node_modules/
 .cache/responses.db
+.cache/analytics.db
+.claude/settings.local.json

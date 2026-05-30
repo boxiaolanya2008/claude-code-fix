@@ -155,6 +155,7 @@ model:             model:
 - [x] SQLite 响应缓存 (支持非流式和流式)
 - [x] 缓存 token 自动清零 (跨提供商安全)
 - [x] 缓存管理 API (统计/清空/清过期)
+- [x] Web 仪表盘 (实时监控命中率趋势)
 
 ## 缓存系统
 
@@ -191,15 +192,30 @@ curl -X POST http://localhost:8080/cache/clear
 curl -X POST http://localhost:8080/cache/clear-expired
 ```
 
+### Web 仪表盘
+
+启动代理后访问 `http://localhost:8080/dashboard`，可以看到：
+
+- 总请求数、命中率、平均响应时间等概览卡片
+- 柱状图 + 折线叠加的趋势图 (30分钟/1小时/6小时/1天/7天)
+- 按缓存类型 (response/streaming) 拆分的命中率
+- 实时事件流 (每 3 秒自动刷新)
+- 中英文切换 (右上角 CN/EN 按钮，自动保存偏好)
+
+数据存在独立的 `.cache/analytics.db` 数据库，不影响缓存本身。
+
 ## 文件结构
 
 ```
 .
 ├── .env.example       # 环境变量模板
 ├── .env               # 实际配置 (cp .env.example .env 后编辑)
+├── analytics.py       # 缓存分析数据库 (独立于缓存)
 ├── cache.py           # SQLite 缓存层 (响应 + 流式)
 ├── converter.py       # Anthropic ↔ OpenAI 格式转换
 ├── server.py          # FastAPI 代理服务 (含 CLI + 配置 + 伪装)
+├── static/
+│   └── dashboard.html # 监控仪表盘页面
 ├── start.bat          # Windows 启动脚本
 ├── claude-settings-example.json  # Claude Code 设置示例
 ├── docs/
@@ -233,6 +249,10 @@ ccf
 | GET | `/cache/stats` | 缓存统计信息 |
 | POST | `/cache/clear` | 清空所有缓存 |
 | POST | `/cache/clear-expired` | 只清过期的缓存 |
+| GET | `/dashboard` | 缓存监控仪表盘 (Web UI) |
+| GET | `/dashboard/summary` | 仪表盘概览数据 |
+| GET | `/dashboard/trend` | 命中率趋势数据 |
+| GET | `/dashboard/events` | 最近缓存事件 |
 
 ## 配置说明
 

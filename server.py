@@ -22,12 +22,17 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 
 load_dotenv()
 
 from converter import convert_request, convert_response, convert_stream
-from cache import init_caches, get_response_cache, get_streaming_cache
+from cache import init_caches, get_response_cache, get_streaming_cache, extract_upstream_cache_info
+
+try:
+    from analytics import init_analytics, record_event, get_summary, get_trend, get_recent
+except ImportError:
+    init_analytics = record_event = get_summary = get_trend = get_recent = None
 
 
 # 启动时修 settings.json，确保 ANTHROPIC_MODEL 是对的
@@ -200,6 +205,8 @@ async def lifespan(app: FastAPI):
         verify=False,
     )
     response_cache, streaming_cache = init_caches()
+    if init_analytics:
+        init_analytics()
     cache_st = "开了" if response_cache and response_cache.enabled else "没开"
     logger.info(
         "代理就绪  %s:%s  →  %s  model=%s  disguise=%s  cache=%s",
@@ -294,6 +301,8 @@ async def handle_messages(request: Request):
         cached_resp, time_saved = cache.get(body, target_cfg.model)
         if cached_resp:
             logger.info("[%s] 缓存命中，省了 %dms", req_id[:12], time_saved)
+            if record_event:
+                record_event("response", True, time_saved, target_cfg.model, cache._gen_key(body, target_cfg.model))
             anthropic_resp = convert_response(cached_resp, target_cfg.disguise_model, request_id=req_id)
             return JSONResponse(anthropic_resp, headers={
                 "x-request-id": req_id,
@@ -302,6 +311,10 @@ async def handle_messages(request: Request):
                 "x-response-time-saved-ms": str(time_saved),
                 "x-tokens-reset": "true",
             })
+
+    # 走到这里说明缓存没命中或缓存关了，记录 miss
+    if record_event:
+        record_event("response", False, 0, target_cfg.model, "")
 
     if stream:
         return await _handle_stream(req_id, oa_body, headers, body)
@@ -336,6 +349,16 @@ async def _handle_non_stream(req_id, oa_body, headers, original_body):
     except Exception:
         return _upstream_error("上游返回的不是 JSON")
 
+    # 追踪上游缓存指标
+    upstream_info = extract_upstream_cache_info(oa_resp)
+    if upstream_info["cached_tokens"] > 0:
+        logger.info(
+            "[%s] 上游缓存命中: %d/%d tokens (%.0f%%)",
+            req_id[:12], upstream_info["cached_tokens"],
+            upstream_info["total_input_tokens"],
+            upstream_info["cache_ratio"] * 100,
+        )
+
     # 存缓存
     cache = get_response_cache()
     if cache:
@@ -357,10 +380,19 @@ async def _handle_stream(req_id, oa_body, headers, original_body):
         cached_events, time_saved = cache.get_events(original_body, target_cfg.model)
         if cached_events:
             logger.info("[%s] 流式缓存命中，省了 %dms", req_id[:12], time_saved)
+            if record_event:
+                record_event("streaming", True, time_saved, target_cfg.model, cache._gen_key(original_body, target_cfg.model))
 
             async def cached_sse_generator():
+                # 模拟真实生成节奏，避免客户端因秒回而行为异常
+                import asyncio as _aio
                 for ev in cached_events:
                     yield ev
+                    # content_block_delta 之间加微延迟，模拟打字效果
+                    if "content_block_delta" in ev:
+                        await _aio.sleep(0.02)
+                    elif "content_block_start" in ev or "content_block_stop" in ev:
+                        await _aio.sleep(0.01)
 
             return StreamingResponse(
                 cached_sse_generator(),
@@ -376,6 +408,10 @@ async def _handle_stream(req_id, oa_body, headers, original_body):
                     "x-tokens-reset": "true",
                 },
             )
+
+    # 流式缓存没命中，记录 miss
+    if record_event:
+        record_event("streaming", False, 0, target_cfg.model, "")
 
     # 线程池同步读上游，通过 Queue 传给 async
     queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -478,6 +514,22 @@ async def _handle_stream(req_id, oa_body, headers, original_body):
                 cache = get_streaming_cache()
                 if cache:
                     cache.set_events(original_body, target_cfg.model, collected_events)
+                # 从最后一个 chunk 提取上游缓存指标
+                for ev in reversed(collected_events):
+                    if "message_delta" in ev and "usage" in ev:
+                        try:
+                            start = ev.find("data: ") + 6
+                            end = ev.find("\n\n", start)
+                            if end == -1:
+                                end = len(ev)
+                            delta_obj = json.loads(ev[start:end])
+                            upstream_usage = delta_obj.get("usage", {})
+                            cached = upstream_usage.get("cached_tokens", 0)
+                            if cached > 0:
+                                logger.info("[%s] 上游流式缓存命中: %d tokens", req_id[:12], cached)
+                        except Exception:
+                            pass
+                        break
 
     return StreamingResponse(
         sse_generator(),
@@ -548,6 +600,41 @@ async def cache_clear_expired():
     if sc:
         res["streaming_cache_evicted"] = sc.clear_expired()
     return {"status": "ok", "evicted": res}
+
+
+# 仪表盘
+
+@app.get("/dashboard")
+async def dashboard():
+    """缓存监控仪表盘。"""
+    if not get_summary:
+        return HTMLResponse("<h1>analytics 模块未安装</h1>", status_code=503)
+    html_path = os.path.join(os.path.dirname(__file__), "static", "dashboard.html")
+    if not os.path.exists(html_path):
+        return HTMLResponse("<h1>仪表盘文件不存在</h1>", status_code=404)
+    with open(html_path, encoding="utf-8") as f:
+        return HTMLResponse(f.read())
+
+
+@app.get("/dashboard/summary")
+async def dashboard_summary():
+    if not get_summary:
+        return {"error": "analytics not available"}
+    return get_summary()
+
+
+@app.get("/dashboard/trend")
+async def dashboard_trend(seconds: int = 3600, bucket: int = 60):
+    if not get_trend:
+        return []
+    return get_trend(seconds=seconds, bucket=bucket)
+
+
+@app.get("/dashboard/events")
+async def dashboard_events(limit: int = 50):
+    if not get_recent:
+        return []
+    return get_recent(limit=limit)
 
 
 @app.get("/")

@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cache Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f8fafc;
+    color: #1e293b;
+    line-height: 1.6;
+  }
+
+  .header {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 14px 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .header h1 {
+    font-size: 18px;
+    font-weight: 600;
+  }
+
+  .header h1 span { color: #3b82f6; }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 13px;
+    color: #94a3b8;
+  }
+
+  .live-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #22c55e;
+    display: inline-block;
+    margin-right: 4px;
+    animation: blink 2s ease-in-out infinite;
+  }
+
+  @keyframes blink {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(34,197,94,0.4); }
+    50% { opacity: 0.5; box-shadow: 0 0 0 4px rgba(34,197,94,0); }
+  }
+
+  /* language toggle */
+  .lang-toggle {
+    display: flex;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    overflow: hidden;
+    cursor: pointer;
+  }
+
+  .lang-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    border: none;
+    background: #fff;
+    color: #64748b;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .lang-btn.active {
+    background: #3b82f6;
+    color: #fff;
+  }
+
+  .main {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 24px 32px;
+  }
+
+  /* summary cards */
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+
+  .card {
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 20px;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+
+  .card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.06);
+  }
+
+  .card-label {
+    font-size: 13px;
+    color: #94a3b8;
+    margin-bottom: 6px;
+  }
+
+  .card-value {
+    font-size: 30px;
+    font-weight: 700;
+    line-height: 1.2;
+    transition: color 0.3s;
+  }
+
+  .card-sub {
+    font-size: 12px;
+    color: #cbd5e1;
+    margin-top: 4px;
+  }
+
+  .green { color: #16a34a; }
+  .blue { color: #3b82f6; }
+  .orange { color: #f59e0b; }
+  .purple { color: #8b5cf6; }
+
+  /* chart section */
+  .chart-section {
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 24px 28px;
+    margin-bottom: 24px;
+    transition: box-shadow 0.2s;
+  }
+
+  .chart-section:hover {
+    box-shadow: 0 2px 12px rgba(0,0,0,0.04);
+  }
+
+  .chart-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 20px;
+  }
+
+  .chart-title {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+
+  .chart-title h2 {
+    font-size: 16px;
+    font-weight: 600;
+  }
+
+  .chart-total {
+    font-size: 13px;
+    color: #94a3b8;
+  }
+
+  .chart-total strong {
+    color: #64748b;
+    font-weight: 600;
+  }
+
+  .chart-controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .time-btns {
+    display: flex;
+    gap: 4px;
+    background: #f1f5f9;
+    border-radius: 8px;
+    padding: 3px;
+  }
+
+  .time-btn {
+    padding: 5px 14px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #64748b;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .time-btn:hover {
+    color: #3b82f6;
+  }
+
+  .time-btn.active {
+    background: #fff;
+    color: #3b82f6;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+
+  .chart-legend {
+    display: flex;
+    gap: 20px;
+    justify-content: center;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #64748b;
+  }
+
+  .legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+  }
+
+  .legend-line {
+    width: 16px;
+    height: 2px;
+    border-radius: 1px;
+    position: relative;
+  }
+
+  .legend-line::after {
+    content: '';
+    position: absolute;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: inherit;
+    top: -2px;
+    left: 5px;
+  }
+
+  .chart-wrap {
+    height: 300px;
+    position: relative;
+  }
+
+  /* bottom grid */
+  .split {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+
+  .panel {
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 24px;
+    transition: box-shadow 0.2s;
+  }
+
+  .panel:hover {
+    box-shadow: 0 2px 12px rgba(0,0,0,0.04);
+  }
+
+  .panel h2 {
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 16px;
+  }
+
+  .breakdown-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 0;
+    border-bottom: 1px solid #f1f5f9;
+  }
+
+  .breakdown-item:last-child { border-bottom: none; }
+
+  .breakdown-name { font-size: 14px; font-weight: 500; }
+
+  .breakdown-stats {
+    display: flex;
+    gap: 16px;
+    font-size: 13px;
+    color: #64748b;
+    align-items: center;
+  }
+
+  .progress-bar {
+    width: 80px;
+    height: 6px;
+    background: #f1f5f9;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  .progress-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: linear-gradient(90deg, #3b82f6, #22c55e);
+    transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  /* events table */
+  .events-section {
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 24px;
+  }
+
+  .events-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+
+  .events-header h2 { font-size: 16px; font-weight: 600; }
+
+  .events-count {
+    font-size: 12px;
+    color: #94a3b8;
+  }
+
+  .event-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+
+  .event-table th {
+    text-align: left;
+    padding: 10px 12px;
+    background: #f8fafc;
+    color: #64748b;
+    font-weight: 500;
+    border-bottom: 1px solid #e2e8f0;
+  }
+
+  .event-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid #f1f5f9;
+    transition: background 0.15s;
+  }
+
+  .event-table tr:hover td { background: #f8fafc; }
+
+  /* row entrance animation */
+  @keyframes fadeSlideIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .event-table tbody tr {
+    animation: fadeSlideIn 0.3s ease forwards;
+  }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .badge-hit {
+    background: #dcfce7;
+    color: #16a34a;
+  }
+
+  .badge-miss {
+    background: #fee2e2;
+    color: #dc2626;
+  }
+
+  .mono {
+    font-family: "SF Mono", Consolas, monospace;
+    font-size: 12px;
+    color: #94a3b8;
+  }
+
+  /* card number animation */
+  @keyframes countUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .card-value {
+    animation: countUp 0.4s ease forwards;
+  }
+
+  .no-data {
+    color: #94a3b8;
+    font-size: 13px;
+    text-align: center;
+    padding: 32px 0;
+  }
+
+  @media (max-width: 768px) {
+    .cards { grid-template-columns: repeat(2, 1fr); }
+    .split { grid-template-columns: 1fr; }
+    .main { padding: 16px; }
+    .header { padding: 12px 16px; }
+    .chart-header { flex-direction: column; gap: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <h1><span>Cache</span> Dashboard</h1>
+  </div>
+  <div class="header-right">
+    <span><span class="live-dot"></span> <span data-i18n="live">Live</span></span>
+    <span id="last-update"></span>
+    <div class="lang-toggle">
+      <button class="lang-btn active" data-lang="zh">CN</button>
+      <button class="lang-btn" data-lang="en">EN</button>
+    </div>
+  </div>
+</div>
+
+<div class="main">
+  <!-- Summary Cards -->
+  <div class="cards">
+    <div class="card">
+      <div class="card-label" data-i18n="total_requests">Total Requests</div>
+      <div class="card-value blue" id="c-total">0</div>
+      <div class="card-sub" id="c-total-sub"></div>
+    </div>
+    <div class="card">
+      <div class="card-label" data-i18n="hit_rate">Hit Rate</div>
+      <div class="card-value green" id="c-rate">0%</div>
+      <div class="card-sub" id="c-rate-sub"></div>
+    </div>
+    <div class="card">
+      <div class="card-label" data-i18n="avg_rt">Avg Response Time</div>
+      <div class="card-value orange" id="c-rt">0ms</div>
+      <div class="card-sub" data-i18n="saved_on_hit">saved on cache hit</div>
+    </div>
+    <div class="card">
+      <div class="card-label" data-i18n="cache_entries">Cache Entries</div>
+      <div class="card-value purple" id="c-entries">0</div>
+      <div class="card-sub" id="c-entries-sub"></div>
+    </div>
+  </div>
+
+  <!-- Chart: stacked bars + line overlay -->
+  <div class="chart-section">
+    <div class="chart-header">
+      <div class="chart-title">
+        <h2 data-i18n="chart_title">Cache Request Overview</h2>
+        <span class="chart-total" id="chart-total-text"></span>
+      </div>
+      <div class="chart-controls">
+        <div class="time-btns">
+          <button class="time-btn" data-range="1800" data-bucket="30" data-i18n="t_30m">30Min</button>
+          <button class="time-btn active" data-range="3600" data-bucket="60" data-i18n="t_1h">1H</button>
+          <button class="time-btn" data-range="21600" data-bucket="300" data-i18n="t_6h">6H</button>
+          <button class="time-btn" data-range="86400" data-bucket="600" data-i18n="t_1d">1D</button>
+          <button class="time-btn" data-range="604800" data-bucket="3600" data-i18n="t_7d">7D</button>
+        </div>
+      </div>
+    </div>
+    <div class="chart-legend">
+      <div class="legend-item">
+        <div class="legend-dot" style="background:#3b82f6;"></div>
+        <span data-i18n="legend_hit">Hit</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-dot" style="background:#f87171;"></div>
+        <span data-i18n="legend_miss">Miss</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-line" style="background:#8b5cf6;"></div>
+        <span data-i18n="legend_rate">Hit Rate %</span>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="main-chart"></canvas>
+    </div>
+  </div>
+
+  <!-- Breakdown + Cache Status -->
+  <div class="split">
+    <div class="panel">
+      <h2 data-i18n="by_cache_type">By Cache Type</h2>
+      <div id="breakdown-list"><div class="no-data" data-i18n="no_data">No data yet</div></div>
+    </div>
+    <div class="panel">
+      <h2 data-i18n="cache_status">Cache Status</h2>
+      <div id="cache-status"><div class="no-data" data-i18n="loading">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Events -->
+  <div class="events-section">
+    <div class="events-header">
+      <h2 data-i18n="recent_events">Recent Events</h2>
+      <span class="events-count" id="events-count"></span>
+    </div>
+    <table class="event-table">
+      <thead>
+        <tr>
+          <th data-i18n="th_time">Time</th>
+          <th data-i18n="th_cache">Cache</th>
+          <th data-i18n="th_result">Result</th>
+          <th data-i18n="th_rt">Response Time</th>
+          <th data-i18n="th_model">Model</th>
+          <th data-i18n="th_key">Key Prefix</th>
+        </tr>
+      </thead>
+      <tbody id="events-body">
+        <tr><td colspan="6" class="no-data" data-i18n="no_events">No events yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+// i18n translations
+const I18N = {
+  zh: {
+    live: '实时',
+    total_requests: '总请求数',
+    hit_rate: '命中率',
+    avg_rt: '平均响应时间',
+    saved_on_hit: '缓存命中时节省',
+    cache_entries: '缓存条目',
+    chart_title: '缓存请求概览',
+    t_30m: '30分钟',
+    t_1h: '1小时',
+    t_6h: '6小时',
+    t_1d: '1天',
+    t_7d: '7天',
+    legend_hit: '命中',
+    legend_miss: '未命中',
+    legend_rate: '命中率 %',
+    by_cache_type: '按缓存类型',
+    cache_status: '缓存状态',
+    no_data: '暂无数据',
+    loading: '加载中...',
+    recent_events: '最近事件',
+    th_time: '时间',
+    th_cache: '缓存',
+    th_result: '结果',
+    th_rt: '响应时间',
+    th_model: '模型',
+    th_key: 'Key 前缀',
+    no_events: '暂无事件',
+    hit: '命中',
+    miss: '未命中',
+    of: '共',
+    hits_lower: '命中',
+    cached: '已缓存',
+    entries: '条目',
+    hit_rate_label: '命中率',
+    saved: '节省',
+    total_label: '总请求',
+    cache_disabled: '缓存未启用',
+    updated: '更新于',
+  },
+  en: {
+    live: 'Live',
+    total_requests: 'Total Requests',
+    hit_rate: 'Hit Rate',
+    avg_rt: 'Avg Response Time',
+    saved_on_hit: 'saved on cache hit',
+    cache_entries: 'Cache Entries',
+    chart_title: 'Cache Request Overview',
+    t_30m: '30Min',
+    t_1h: '1H',
+    t_6h: '6H',
+    t_1d: '1D',
+    t_7d: '7D',
+    legend_hit: 'Hit',
+    legend_miss: 'Miss',
+    legend_rate: 'Hit Rate %',
+    by_cache_type: 'By Cache Type',
+    cache_status: 'Cache Status',
+    no_data: 'No data yet',
+    loading: 'Loading...',
+    recent_events: 'Recent Events',
+    th_time: 'Time',
+    th_cache: 'Cache',
+    th_result: 'Result',
+    th_rt: 'Response Time',
+    th_model: 'Model',
+    th_key: 'Key Prefix',
+    no_events: 'No events yet',
+    hit: 'HIT',
+    miss: 'MISS',
+    of: 'of',
+    hits_lower: 'hits',
+    cached: 'cached',
+    entries: 'entries',
+    hit_rate_label: 'Hit Rate',
+    saved: 'saved',
+    total_label: 'Total Requests',
+    cache_disabled: 'Cache is disabled',
+    updated: 'Updated',
+  }
+};
+
+let lang = localStorage.getItem('dash_lang') || 'zh';
+let chart = null;
+let currentRange = 3600;
+let currentBucket = 60;
+
+function t(key) { return (I18N[lang] && I18N[lang][key]) || key; }
+
+function applyLang() {
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    if (I18N[lang] && I18N[lang][key]) {
+      el.textContent = I18N[lang][key];
+    }
+  });
+  document.querySelectorAll('.lang-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.lang === lang);
+  });
+}
+
+document.querySelectorAll('.lang-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    lang = btn.dataset.lang;
+    localStorage.setItem('dash_lang', lang);
+    applyLang();
+    refreshAll();
+  });
+});
+
+function fmtNum(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return n.toString();
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString(lang === 'zh' ? 'zh-CN' : 'en-US', { hour: '2-digit', minute: '2-digit' });
+}
+
+function fmtFull(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleString(lang === 'zh' ? 'zh-CN' : 'en-US', {
+    month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+}
+
+// Summary
+async function refreshSummary() {
+  try {
+    const r = await fetch('/dashboard/summary');
+    const d = await r.json();
+
+    document.getElementById('c-total').textContent = fmtNum(d.total);
+    document.getElementById('c-total-sub').textContent = d.hits + ' ' + t('hits_lower') + ' / ' + d.misses + ' ' + t('miss');
+    document.getElementById('c-rate').textContent = (d.hit_rate * 100).toFixed(1) + '%';
+    document.getElementById('c-rate-sub').textContent = d.hits + ' ' + t('of') + ' ' + d.total + ' ' + t('cached');
+    document.getElementById('c-rt').textContent = d.avg_response_time_ms.toFixed(0) + 'ms';
+
+    // Chart total text
+    document.getElementById('chart-total-text').innerHTML =
+      '| <strong>' + fmtNum(d.total) + '</strong> ' + t('total_label');
+
+    // Breakdown
+    const bl = document.getElementById('breakdown-list');
+    const bc = d.by_cache || {};
+    const keys = Object.keys(bc);
+    if (keys.length === 0) {
+      bl.innerHTML = '<div class="no-data">' + t('no_data') + '</div>';
+    } else {
+      bl.innerHTML = keys.map(k => {
+        const v = bc[k];
+        const pct = (v.hit_rate * 100).toFixed(1);
+        return '<div class="breakdown-item">' +
+          '<div><div class="breakdown-name">' + k + '</div>' +
+          '<div style="font-size:12px;color:#94a3b8;">' + v.total + ' ' + t('total_label') + ', ' + v.hits + ' ' + t('hits_lower') + '</div></div>' +
+          '<div class="breakdown-stats">' +
+          '<span>' + pct + '%</span>' +
+          '<div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div>' +
+          '</div></div>';
+      }).join('');
+    }
+  } catch(e) { console.error('summary:', e); }
+}
+
+// Main chart: stacked bars + line
+async function refreshTrend() {
+  try {
+    const r = await fetch('/dashboard/trend?seconds=' + currentRange + '&bucket=' + currentBucket);
+    const data = await r.json();
+
+    const labels = data.map(d => fmtTime(d.time));
+    const hits = data.map(d => d.hits);
+    const misses = data.map(d => d.misses);
+    const hitRates = data.map(d => +(d.hit_rate * 100).toFixed(1));
+
+    if (chart) {
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = hits;
+      chart.data.datasets[1].data = misses;
+      chart.data.datasets[2].data = hitRates;
+      chart.update('default');
+    } else {
+      const ctx = document.getElementById('main-chart').getContext('2d');
+      chart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: labels,
+          datasets: [
+            {
+              label: t('legend_hit'),
+              data: hits,
+              backgroundColor: 'rgba(59, 130, 246, 0.75)',
+              borderColor: 'rgba(59, 130, 246, 1)',
+              borderWidth: 0,
+              borderRadius: 3,
+              borderSkipped: false,
+              stack: 'bar',
+              yAxisID: 'y',
+              order: 2,
+            },
+            {
+              label: t('legend_miss'),
+              data: misses,
+              backgroundColor: 'rgba(248, 113, 113, 0.65)',
+              borderColor: 'rgba(248, 113, 113, 1)',
+              borderWidth: 0,
+              borderRadius: 3,
+              borderSkipped: false,
+              stack: 'bar',
+              yAxisID: 'y',
+              order: 3,
+            },
+            {
+              label: t('legend_rate'),
+              data: hitRates,
+              type: 'line',
+              borderColor: '#8b5cf6',
+              backgroundColor: 'transparent',
+              borderWidth: 2.5,
+              pointRadius: 0,
+              pointHoverRadius: 5,
+              pointHoverBackgroundColor: '#8b5cf6',
+              pointHoverBorderColor: '#fff',
+              pointHoverBorderWidth: 2,
+              tension: 0.4,
+              yAxisID: 'y1',
+              order: 1,
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
+          animation: {
+            duration: 600,
+            easing: 'easeOutQuart',
+          },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: 'rgba(30, 41, 59, 0.95)',
+              titleFont: { size: 12, weight: '500' },
+              bodyFont: { size: 12 },
+              padding: 12,
+              cornerRadius: 8,
+              displayColors: true,
+              boxPadding: 4,
+              callbacks: {
+                label: function(ctx) {
+                  if (ctx.datasetIndex === 2) {
+                    return ' ' + t('hit_rate_label') + ': ' + ctx.parsed.y.toFixed(1) + '%';
+                  }
+                  return ' ' + ctx.dataset.label + ': ' + ctx.parsed.y;
+                }
+              }
+            },
+          },
+          scales: {
+            x: {
+              grid: { display: false },
+              ticks: {
+                font: { size: 11 },
+                color: '#94a3b8',
+                maxTicksLimit: 14,
+              },
+              border: { display: false },
+            },
+            y: {
+              position: 'left',
+              grid: { color: '#f1f5f9', drawBorder: false },
+              ticks: {
+                font: { size: 11 },
+                color: '#94a3b8',
+                padding: 8,
+              },
+              border: { display: false },
+              beginAtZero: true,
+            },
+            y1: {
+              position: 'right',
+              grid: { display: false },
+              ticks: {
+                font: { size: 11 },
+                color: '#94a3b8',
+                callback: v => v + '%',
+                padding: 8,
+              },
+              border: { display: false },
+              min: 0,
+              max: 100,
+            }
+          }
+        }
+      });
+    }
+  } catch(e) { console.error('trend:', e); }
+}
+
+// Recent events
+async function refreshEvents() {
+  try {
+    const r = await fetch('/dashboard/events?limit=30');
+    const data = await r.json();
+
+    const tbody = document.getElementById('events-body');
+    if (data.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="no-data">' + t('no_events') + '</td></tr>';
+    } else {
+      tbody.innerHTML = data.map((e, i) =>
+        '<tr style="animation-delay:' + (i * 0.03) + 's">' +
+        '<td class="mono">' + fmtFull(e.time) + '</td>' +
+        '<td>' + e.cache + '</td>' +
+        '<td><span class="badge ' + (e.hit ? 'badge-hit' : 'badge-miss') + '">' + (e.hit ? t('hit') : t('miss')) + '</span></td>' +
+        '<td class="mono">' + e.rt_ms + 'ms</td>' +
+        '<td class="mono">' + (e.model || '-') + '</td>' +
+        '<td class="mono">' + (e.key || '-') + '</td>' +
+        '</tr>'
+      ).join('');
+    }
+    document.getElementById('events-count').textContent = data.length;
+  } catch(e) { console.error('events:', e); }
+}
+
+// Cache status
+async function refreshCacheStatus() {
+  try {
+    const r = await fetch('/cache/stats');
+    const d = await r.json();
+    const el = document.getElementById('cache-status');
+    const parts = [];
+
+    if (d.response_cache && d.response_cache.enabled) {
+      parts.push(buildStatus(d.response_cache, 'Response Cache'));
+    }
+    if (d.streaming_cache && d.streaming_cache.enabled) {
+      parts.push(buildStatus(d.streaming_cache, 'Streaming Cache'));
+    }
+
+    if (parts.length === 0) {
+      el.innerHTML = '<div class="no-data">' + t('cache_disabled') + '</div>';
+    } else {
+      el.innerHTML = parts.join('');
+    }
+  } catch(e) { console.error('cache status:', e); }
+}
+
+function buildStatus(c, name) {
+  const pct = c.hit_rate !== undefined ? (c.hit_rate * 100).toFixed(1) + '%' : '-';
+  const entries = c.entries || c.total_entries || 0;
+  const saved = (c.saved_ms || c.total_response_time_saved_ms || 0);
+  const ttl = c.ttl || c.ttl_seconds || '?';
+  return '<div class="breakdown-item">' +
+    '<div><div class="breakdown-name">' + name + '</div>' +
+    '<div style="font-size:12px;color:#94a3b8;">TTL ' + ttl + 's</div></div>' +
+    '<div class="breakdown-stats">' +
+    '<span>' + entries + ' ' + t('entries') + '</span>' +
+    '<span>' + pct + ' ' + t('hit_rate_label') + '</span>' +
+    '<span>' + saved.toFixed(0) + 'ms ' + t('saved') + '</span>' +
+    '</div></div>';
+}
+
+// Time range buttons
+document.querySelectorAll('.time-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.time-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentRange = parseInt(btn.dataset.range);
+    currentBucket = parseInt(btn.dataset.bucket);
+    refreshTrend();
+  });
+});
+
+// Refresh
+function refreshAll() {
+  refreshSummary();
+  refreshTrend();
+  refreshEvents();
+  refreshCacheStatus();
+  document.getElementById('last-update').textContent = t('updated') + ' ' + new Date().toLocaleTimeString(lang === 'zh' ? 'zh-CN' : 'en-US');
+}
+
+applyLang();
+refreshAll();
+setInterval(refreshAll, 3000);
+</script>
+</body>
+</html>
