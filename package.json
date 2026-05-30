@@ -1,7 +1,7 @@
 {
   "name": "claudecode-fix",
   "version": "1.0.1",
-  "description": "Fix Claude Code 400 error when using third-party models",
+  "description": "Claude Code proxy - use any LLM with Claude Code via OpenAI-compatible API proxy (DeepSeek, Qwen, Ollama, etc.)",
   "main": "index.js",
   "bin": {
     "ccf": "./ccf.js"
@@ -14,7 +14,17 @@
     "claude",
     "proxy",
     "openai",
-    "api"
+    "api",
+    "llm",
+    "ai",
+    "anthropic",
+    "anthropic-api",
+    "claude-code",
+    "model-proxy",
+    "openai-compatible",
+    "deepseek",
+    "qwen",
+    "ollama"
   ],
   "author": "boxiaolanya2008",
   "license": "MIT",
