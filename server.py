@@ -1,8 +1,7 @@
-"""FastAPI proxy server — exposes an Anthropic-compatible /v1/messages endpoint.
+"""FastAPI 代理服务器，暴露 Anthropic 兼容的 /v1/messages 接口。
 
-Claude Code talks to this server as if it were api.anthropic.com.
-Requests are forwarded (with format conversion) to the upstream target API
-configured via .env.
+Claude Code 把这个服务器当 api.anthropic.com，请求到这里转成 OpenAI 格式，
+转发给第三方 API，响应回来再转回 Anthropic 格式。
 """
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ import asyncio
 import json
 import logging
 import os
-import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -26,72 +24,67 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-# 加载 .env 文件
 load_dotenv()
 
 from converter import convert_request, convert_response, convert_stream
 from cache import init_caches, get_response_cache, get_streaming_cache
 
-# ---------------------------------------------------------------------------
-# Auto-fix ~/.claude/settings.json
-# ---------------------------------------------------------------------------
 
-def _fix_claude_settings() -> None:
-    """Read ~/.claude/settings.json and set ANTHROPIC_MODEL to Opus 4.8[1m]"""
+# 启动时修 settings.json，确保 ANTHROPIC_MODEL 是对的
+
+def _fix_claude_settings():
+    """读 ~/.claude/settings.json，把 ANTHROPIC_MODEL 设成 Opus 4.8[1m]。
+
+    Claude Code 启动时会读这个值，值不对就报 400。
+    """
     settings_path = os.path.expanduser("~/.claude/settings.json")
     if not os.path.exists(settings_path):
-        logger.info("Settings file not found: %s", settings_path)
+        logger.info("settings 文件不在: %s", settings_path)
         return
 
     try:
         with open(settings_path, "r", encoding="utf-8") as f:
             settings = json.load(f)
 
-        # Ensure env section exists
         if "env" not in settings:
             settings["env"] = {}
 
-        # Set ANTHROPIC_MODEL
-        old_model = settings["env"].get("ANTHROPIC_MODEL", "")
+        old = settings["env"].get("ANTHROPIC_MODEL", "")
         settings["env"]["ANTHROPIC_MODEL"] = "Opus 4.8[1m]"
 
         with open(settings_path, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2, ensure_ascii=False)
 
-        if old_model != "Opus 4.8[1m]":
-            logger.info("Fixed ANTHROPIC_MODEL: %s → Opus 4.8[1m]", old_model)
+        if old != "Opus 4.8[1m]":
+            logger.info("修好了 ANTHROPIC_MODEL: %s → Opus 4.8[1m]", old)
         else:
-            logger.info("ANTHROPIC_MODEL already set to Opus 4.8[1m]")
-
+            logger.info("ANTHROPIC_MODEL 已经是 Opus 4.8[1m]，不用改")
     except Exception as e:
-        logger.error("Failed to fix settings: %s", e)
+        logger.error("修 settings 失败: %s", e)
 
-# ---------------------------------------------------------------------------
-# CLI arguments
-# ---------------------------------------------------------------------------
 
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Claude Code → third-party model proxy")
-    p.add_argument("-m", "--model",      help="Target model name (default: from .env)")
-    p.add_argument("-b", "--api-base",   help="Target API base URL")
-    p.add_argument("-k", "--api-key",    help="Target API key")
-    p.add_argument("-p", "--port",       type=int, help="Proxy listen port")
-    p.add_argument("-H", "--host",       help="Proxy listen host")
+# 命令行参数
+
+def _parse_args():
+    p = argparse.ArgumentParser(description="Claude Code → 第三方模型代理")
+    p.add_argument("-m", "--model",      help="目标模型名 (默认读 .env)")
+    p.add_argument("-b", "--api-base",   help="目标 API 地址")
+    p.add_argument("-k", "--api-key",    help="目标 API 密钥")
+    p.add_argument("-p", "--port",       type=int, help="监听端口")
+    p.add_argument("-H", "--host",       help="监听地址")
     return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Config dataclasses (lightweight — avoid extra import for CLI override)
-# ---------------------------------------------------------------------------
+# 配置
 
 from dataclasses import dataclass, field as _field  # noqa: E402
 
-def _env(key: str, default: str = "") -> str:
+def _env(key, default=""):
     return os.getenv(key, default).strip()
 
 
-def _read_settings_env(key: str) -> str:
-    """Read a key from the env section of ~/.claude/settings.json."""
+def _read_settings_env(key):
+    """从 ~/.claude/settings.json 的 env 字段读值。"""
     settings_path = os.path.expanduser("~/.claude/settings.json")
     if not os.path.exists(settings_path):
         return ""
@@ -103,16 +96,16 @@ def _read_settings_env(key: str) -> str:
         return ""
 
 
-def _resolve_disguise_model() -> str:
-    """Resolve disguise model: DISGUISE_MODEL env > settings.json ANTHROPIC_MODEL > empty."""
+def _resolve_disguise_model():
+    """伪装模型名：优先 .env 的 DISGUISE_MODEL，没有就读 settings.json。"""
     env_val = _env("DISGUISE_MODEL")
     if env_val:
         return env_val
     return _read_settings_env("ANTHROPIC_MODEL")
 
 
-def _resolve_disguise_api_base() -> str:
-    """Resolve disguise API base: DISGUISE_API_BASE env > settings.json ANTHROPIC_BASE_URL > default."""
+def _resolve_disguise_api_base():
+    """伪装 API 地址：优先 .env，其次 settings.json，默认 anthropic。"""
     env_val = _env("DISGUISE_API_BASE")
     if env_val:
         return env_val
@@ -124,6 +117,7 @@ def _resolve_disguise_api_base() -> str:
 
 @dataclass(frozen=True)
 class TargetConfig:
+    """目标 API 配置，从 .env 读。"""
     api_key: str   = _field(default_factory=lambda: _env("TARGET_API_KEY"))
     api_base: str  = _field(default_factory=lambda: _env("TARGET_API_BASE", "https://api.openai.com/v1"))
     model: str     = _field(default_factory=lambda: _env("TARGET_MODEL", "gpt-4o"))
@@ -133,37 +127,35 @@ class TargetConfig:
     timeout: float = _field(default_factory=lambda: float(_env("TARGET_TIMEOUT", "300")))
 
     @property
-    def chat_url(self) -> str:
+    def chat_url(self):
         return f"{self.api_base.rstrip('/')}/chat/completions"
 
     @property
-    def models_url(self) -> str:
+    def models_url(self):
         return f"{self.api_base.rstrip('/')}/models"
 
-    def validate(self) -> None:
+    def validate(self):
         if not self.api_key:
-            raise ValueError("TARGET_API_KEY is required (set via --api-key or .env)")
+            raise ValueError("TARGET_API_KEY 必须配置")
 
 
 @dataclass(frozen=True)
 class ProxyConfig:
+    """代理服务器自己的配置。"""
     host: str     = _field(default_factory=lambda: _env("PROXY_HOST", "0.0.0.0"))
     port: int     = _field(default_factory=lambda: int(_env("PROXY_PORT", "8080")))
     auth_key: str = _field(default_factory=lambda: _env("ANTHROPIC_API_KEY"))
     log_level: str = _field(default_factory=lambda: _env("LOG_LEVEL", "info"))
 
 
-def _load_config(args: argparse.Namespace) -> tuple[TargetConfig, ProxyConfig]:
-    """Build configs from .env, then override with CLI arguments."""
-    # Target — start from env, override with CLI
+def _load_config(args):
+    """.env 优先，命令行能覆盖。"""
     t = TargetConfig(
         api_key=args.api_key  or _env("TARGET_API_KEY"),
         api_base=args.api_base or _env("TARGET_API_BASE", "https://api.openai.com/v1"),
         model=args.model      or _env("TARGET_MODEL", "gpt-4o"),
     )
     t.validate()
-
-    # Proxy — start from env, override with CLI
     p = ProxyConfig(
         host=args.host or _env("PROXY_HOST", "0.0.0.0"),
         port=args.port or int(_env("PROXY_PORT", "8080")),
@@ -171,9 +163,7 @@ def _load_config(args: argparse.Namespace) -> tuple[TargetConfig, ProxyConfig]:
     return t, p
 
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+# 日志
 
 logging.basicConfig(
     level=logging.INFO,
@@ -182,21 +172,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("proxy")
 
-# ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
+
+# 全局状态
 
 target_cfg: TargetConfig
 proxy_cfg: ProxyConfig
 http_client: httpx.AsyncClient
 
-# 多线程接收 token 的线程池
+# 流式请求用线程池同步读上游，绕过 async httpx 的各种坑
 token_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="token-receiver")
 
-# Cache instances
 response_cache = None
 streaming_cache = None
 
+
+# 生命周期
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -209,23 +199,20 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
         verify=False,
     )
-    # Initialize caches
     response_cache, streaming_cache = init_caches()
+    cache_st = "开了" if response_cache and response_cache.enabled else "没开"
     logger.info(
-        "Proxy ready  %s:%s  →  %s  model=%s  disguise=%s  cache=%s",
-        proxy_cfg.host, proxy_cfg.port, target_cfg.api_base, target_cfg.model, target_cfg.disguise_model,
-        "enabled" if response_cache and response_cache.enabled else "disabled",
+        "代理就绪  %s:%s  →  %s  model=%s  disguise=%s  cache=%s",
+        proxy_cfg.host, proxy_cfg.port, target_cfg.api_base,
+        target_cfg.model, target_cfg.disguise_model, cache_st,
     )
     yield
     await http_client.aclose()
-    # 关闭线程池，等待所有线程完成
     token_executor.shutdown(wait=True)
-    logger.info("Token receiver thread pool shut down")
+    logger.info("线程池已关闭")
 
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
+# FastAPI
 
 app = FastAPI(title="Claude Code Proxy", lifespan=lifespan)
 app.add_middleware(
@@ -236,12 +223,10 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# Auth helper
-# ---------------------------------------------------------------------------
+# 鉴权
 
-def _extract_api_key(request: Request) -> str:
-    """Pull the API key from x-api-key or Authorization header."""
+def _extract_api_key(request):
+    """从请求头拿 key，支持 x-api-key 和 Authorization Bearer。"""
     key = request.headers.get("x-api-key", "")
     if not key:
         auth = request.headers.get("authorization", "")
@@ -250,8 +235,8 @@ def _extract_api_key(request: Request) -> str:
     return key
 
 
-def _check_auth(request: Request) -> str | None:
-    """Return error message if auth fails, else None."""
+def _check_auth(request):
+    """校验 API key，没配 auth_key 就直接放行。"""
     if not proxy_cfg.auth_key:
         return None
     if _extract_api_key(request) == proxy_cfg.auth_key:
@@ -259,9 +244,7 @@ def _check_auth(request: Request) -> str | None:
     return "Invalid API key"
 
 
-# ---------------------------------------------------------------------------
-# POST /v1/messages
-# ---------------------------------------------------------------------------
+# POST /v1/messages 核心入口
 
 @app.post("/v1/messages")
 async def handle_messages(request: Request):
@@ -280,52 +263,44 @@ async def handle_messages(request: Request):
     req_id = f"msg_{uuid.uuid4().hex[:24]}"
     stream = body.get("stream", False)
 
-    # Debug: log original request
-    import json as _json
-    logger.debug("[%s] RAW BODY: %s", req_id[:12], _json.dumps(body, ensure_ascii=False)[:2000])
+    logger.debug("[%s] 原始请求: %s", req_id[:12], json.dumps(body, ensure_ascii=False)[:2000])
 
+    # Anthropic → OpenAI 格式
     oa_body = convert_request(body, target_cfg.model)
 
-    # Attach disguise values using Anthropic official keys
+    # 塞伪装字段，有些 SDK 会检查这俩
     oa_body["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
     oa_body["ANTHROPIC_MODEL"] = target_cfg.disguise_model
 
-    # Debug: log converted request
-    logger.debug("[%s] OA BODY: %s", req_id[:12], _json.dumps(oa_body, ensure_ascii=False)[:2000])
+    logger.debug("[%s] 转换后: %s", req_id[:12], json.dumps(oa_body, ensure_ascii=False)[:2000])
     oa_body.setdefault("stream", stream)
 
     headers = {
         "Authorization": f"Bearer {target_cfg.api_key}",
         "Content-Type": "application/json",
     }
-    # Forward anthropic-version if present (some SDKs check it)
     if v := request.headers.get("anthropic-version"):
         headers["anthropic-version"] = v
 
     logger.info(
         "[%s] %s → %s  disguise=%s  (stream=%s)",
-        req_id[:12],
-        body.get("model", "?"),
-        target_cfg.model,
-        target_cfg.disguise_model,
-        stream,
+        req_id[:12], body.get("model", "?"),
+        target_cfg.model, target_cfg.disguise_model, stream,
     )
 
-    # Check cache first (non-streaming only)
+    # 非流式才走缓存
     cache = get_response_cache()
     if cache and not stream:
         cached_resp, time_saved = cache.get(body, target_cfg.model)
         if cached_resp:
-            logger.info(
-                "[%s] CACHE HIT → served from cache (saved ~%dms)",
-                req_id[:12], time_saved,
-            )
+            logger.info("[%s] 缓存命中，省了 %dms", req_id[:12], time_saved)
             anthropic_resp = convert_response(cached_resp, target_cfg.disguise_model, request_id=req_id)
             return JSONResponse(anthropic_resp, headers={
                 "x-request-id": req_id,
                 "anthropic-version": "2023-06-01",
                 "x-cache-hit": "true",
                 "x-response-time-saved-ms": str(time_saved),
+                "x-tokens-reset": "true",
             })
 
     if stream:
@@ -334,17 +309,17 @@ async def handle_messages(request: Request):
         return await _handle_non_stream(req_id, oa_body, headers, body)
 
 
-# ---- non-streaming -------------------------------------------------------
+# 非流式处理
 
-async def _handle_non_stream(req_id: str, oa_body: dict, headers: dict, original_body: dict) -> Response:
+async def _handle_non_stream(req_id, oa_body, headers, original_body):
     try:
         resp = await http_client.post(target_cfg.chat_url, json=oa_body, headers=headers)
     except httpx.HTTPError as exc:
-        logger.error("[%s] upstream error: %s", req_id[:12], exc)
+        logger.error("[%s] 上游出错: %s", req_id[:12], exc)
         return _upstream_error(str(exc))
 
     if resp.status_code != 200:
-        logger.warning("[%s] upstream %d: %s", req_id[:12], resp.status_code, resp.text[:300])
+        logger.warning("[%s] 上游返回 %d: %s", req_id[:12], resp.status_code, resp.text[:300])
         return JSONResponse(
             {
                 "type": "error",
@@ -359,9 +334,9 @@ async def _handle_non_stream(req_id: str, oa_body: dict, headers: dict, original
     try:
         oa_resp = resp.json()
     except Exception:
-        return _upstream_error("Invalid JSON from upstream")
+        return _upstream_error("上游返回的不是 JSON")
 
-    # Cache the response for future requests
+    # 存缓存
     cache = get_response_cache()
     if cache:
         cache.set(original_body, target_cfg.model, oa_resp)
@@ -373,21 +348,20 @@ async def _handle_non_stream(req_id: str, oa_body: dict, headers: dict, original
     })
 
 
-# ---- streaming -----------------------------------------------------------
+# 流式处理
 
-async def _handle_stream(req_id: str, oa_body: dict, headers: dict, original_body: dict) -> StreamingResponse:
-    # Check streaming cache first
+async def _handle_stream(req_id, oa_body, headers, original_body):
+    # 流式缓存
     cache = get_streaming_cache()
     if cache:
         cached_events, time_saved = cache.get_events(original_body, target_cfg.model)
         if cached_events:
-            logger.info(
-                "[%s] STREAM CACHE HIT → served from cache (saved ~%dms)",
-                req_id[:12], time_saved,
-            )
-            async def cached_sse_generator() -> AsyncGenerator[str, None]:
-                for event_line in cached_events:
-                    yield event_line
+            logger.info("[%s] 流式缓存命中，省了 %dms", req_id[:12], time_saved)
+
+            async def cached_sse_generator():
+                for ev in cached_events:
+                    yield ev
+
             return StreamingResponse(
                 cached_sse_generator(),
                 media_type="text/event-stream",
@@ -399,16 +373,17 @@ async def _handle_stream(req_id: str, oa_body: dict, headers: dict, original_bod
                     "anthropic-version": "2023-06-01",
                     "x-cache-hit": "true",
                     "x-response-time-saved-ms": str(time_saved),
+                    "x-tokens-reset": "true",
                 },
             )
 
-    # 在线程中使用同步 httpx.Client 发送流式请求
+    # 线程池同步读上游，通过 Queue 传给 async
     queue: asyncio.Queue[str | None] = asyncio.Queue()
     loop = asyncio.get_event_loop()
     collected_events: list[str] = []
 
     def read_upstream():
-        """在线程中用同步 Client 读取上游数据，完成后自动废弃线程"""
+        """同步读上游 SSE 流，读完线程自动退出。"""
         sync_client = httpx.Client(
             timeout=httpx.Timeout(target_cfg.timeout, connect=10),
             verify=False,
@@ -428,23 +403,20 @@ async def _handle_stream(req_id: str, oa_body: dict, headers: dict, original_bod
                     if line:
                         loop.call_soon_threadsafe(queue.put_nowait, line)
         except Exception as e:
-            logger.error("[%s] thread read error: %s", req_id[:12], e)
-            loop.call_soon_threadsafe(
-                queue.put_nowait, f"__EXCEPTION__{e}",
-            )
+            logger.error("[%s] 线程读取出错: %s", req_id[:12], e)
+            loop.call_soon_threadsafe(queue.put_nowait, f"__EXCEPTION__{e}")
         finally:
             sync_client.close()
             loop.call_soon_threadsafe(queue.put_nowait, None)
-            logger.debug("[%s] token receiver thread exiting", req_id[:12])
 
     future = token_executor.submit(read_upstream)
 
-    async def sse_generator() -> AsyncGenerator[str, None]:
-        def _sse(event: str, data: dict) -> str:
+    async def sse_generator():
+        def _sse(event, data):
             return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-        def _is_error(line: str) -> str | None:
-            """检测线程错误标记，返回错误消息或 None"""
+        def _is_error(line):
+            """检测线程传过来的错误标记。"""
             if line.startswith("__ERROR__"):
                 parts = line.split("__", 2)
                 status_code = int(parts[1])
@@ -455,13 +427,14 @@ async def _handle_stream(req_id: str, oa_body: dict, headers: dict, original_bod
             return None
 
         try:
-            async def raw_upstream_lines() -> AsyncGenerator[str, None]:
+            async def raw_upstream_lines():
                 while True:
                     line = await queue.get()
                     if line is None:
                         break
                     yield line
 
+            # 先拿第一行，判断是正常还是出错
             first_line = None
             async for line in raw_upstream_lines():
                 first_line = line
@@ -470,7 +443,7 @@ async def _handle_stream(req_id: str, oa_body: dict, headers: dict, original_bod
             if first_line is None:
                 yield _sse("error", {
                     "type": "error",
-                    "error": {"type": "api_error", "message": "Upstream returned empty response"},
+                    "error": {"type": "api_error", "message": "上游返回空响应"},
                 })
                 return
 
@@ -486,8 +459,8 @@ async def _handle_stream(req_id: str, oa_body: dict, headers: dict, original_bod
                 })
                 return
 
-            # 正常流 — 回放 first_line 后继续
-            async def replay() -> AsyncGenerator[str, None]:
+            # 正常流，把第一行塞回去继续转
+            async def replay():
                 yield first_line
                 async for line in raw_upstream_lines():
                     yield line
@@ -500,13 +473,11 @@ async def _handle_stream(req_id: str, oa_body: dict, headers: dict, original_bod
                 future.result(timeout=5)
             except Exception:
                 pass
-            # Cache the collected streaming events
+            # 流结束存缓存
             if collected_events:
                 cache = get_streaming_cache()
                 if cache:
                     cache.set_events(original_body, target_cfg.model, collected_events)
-                    logger.debug("[%s] Cached %d streaming events", req_id[:12], len(collected_events))
-            logger.debug("[%s] token receiver thread completed and discarded", req_id[:12])
 
     return StreamingResponse(
         sse_generator(),
@@ -521,28 +492,22 @@ async def _handle_stream(req_id: str, oa_body: dict, headers: dict, original_bod
     )
 
 
-# ---------------------------------------------------------------------------
-# GET /v1/models  (for compatibility)
-# ---------------------------------------------------------------------------
+# GET /v1/models 兼容
 
 @app.get("/v1/models")
 async def handle_models():
     return {
-        "data": [
-            {
-                "id": target_cfg.disguise_model,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "proxy",
-            }
-        ],
+        "data": [{
+            "id": target_cfg.disguise_model,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "proxy",
+        }],
         "object": "list",
     }
 
 
-# ---------------------------------------------------------------------------
-# Health
-# ---------------------------------------------------------------------------
+# 健康检查和缓存管理
 
 @app.get("/health")
 async def health():
@@ -551,63 +516,60 @@ async def health():
 
 @app.get("/cache/stats")
 async def cache_stats():
-    """Return cache statistics for both response and streaming caches."""
-    resp_cache = get_response_cache()
-    stream_cache = get_streaming_cache()
+    rc = get_response_cache()
+    sc = get_streaming_cache()
     return {
-        "response_cache": resp_cache.stats() if resp_cache else {"enabled": False},
-        "streaming_cache": stream_cache.stats() if stream_cache else {"enabled": False},
+        "response_cache": rc.stats() if rc else {"enabled": False},
+        "streaming_cache": sc.stats() if sc else {"enabled": False},
     }
 
 
 @app.post("/cache/clear")
 async def cache_clear():
-    """Clear all cache entries (expired and active)."""
-    resp_cache = get_response_cache()
-    stream_cache = get_streaming_cache()
-    results = {}
-    if resp_cache:
-        results["response_cache_cleared"] = resp_cache.clear_all()
-    if stream_cache:
-        results["streaming_cache_cleared"] = stream_cache.clear_all()
-    return {"status": "ok", "cleared": results}
+    """全清。"""
+    rc = get_response_cache()
+    sc = get_streaming_cache()
+    res = {}
+    if rc:
+        res["response_cache_cleared"] = rc.clear_all()
+    if sc:
+        res["streaming_cache_cleared"] = sc.clear_all()
+    return {"status": "ok", "cleared": res}
 
 
 @app.post("/cache/clear-expired")
 async def cache_clear_expired():
-    """Clear only expired cache entries."""
-    resp_cache = get_response_cache()
-    stream_cache = get_streaming_cache()
-    results = {}
-    if resp_cache:
-        results["response_cache_evicted"] = resp_cache.clear_expired()
-    if stream_cache:
-        results["streaming_cache_evicted"] = stream_cache.clear_expired()
-    return {"status": "ok", "evicted": results}
+    """只清过期的。"""
+    rc = get_response_cache()
+    sc = get_streaming_cache()
+    res = {}
+    if rc:
+        res["response_cache_evicted"] = rc.clear_expired()
+    if sc:
+        res["streaming_cache_evicted"] = sc.clear_expired()
+    return {"status": "ok", "evicted": res}
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "proxy": "claude-code-proxy", "model": target_cfg.disguise_model, "api": target_cfg.disguise_api_base}
+    return {
+        "status": "ok",
+        "proxy": "claude-code-proxy",
+        "model": target_cfg.disguise_model,
+        "api": target_cfg.disguise_api_base,
+    }
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# 工具函数
 
-def _upstream_error(msg: str) -> JSONResponse:
+def _upstream_error(msg):
     return JSONResponse(
-        {
-            "type": "error",
-            "error": {"type": "api_error", "message": msg},
-        },
+        {"type": "error", "error": {"type": "api_error", "message": msg}},
         502,
     )
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# 启动入口
 
 if __name__ == "__main__":
     args = _parse_args()
