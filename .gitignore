@@ -7,3 +7,4 @@ build/
 .venv/
 venv/
 node_modules/
+.cache/responses.db

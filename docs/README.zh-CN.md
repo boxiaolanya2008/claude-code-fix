@@ -152,6 +152,44 @@ model:             model:
 - [x] 代理鉴权 (可选)
 - [x] 图片输入 (base64 / URL)
 - [x] 自动从 `~/.claude/settings.json` 读取伪装值
+- [x] SQLite 响应缓存 (支持非流式和流式)
+- [x] 缓存 token 自动清零 (跨提供商安全)
+- [x] 缓存管理 API (统计/清空/清过期)
+
+## 缓存系统
+
+基于 SQLite 的响应缓存，支持非流式和流式两种模式。
+
+### 为什么需要缓存
+
+Claude Code 每轮对话都发完整消息历史，如果 hash 整个请求体，几乎永远不命中（之前只有 3%）。所以提供了 `prefix` 模式，只看 system prompt + 最后一条 user 消息 + tools 定义，忽略历史消息。
+
+### 缓存 key 模式
+
+通过 `CACHE_KEY_MODE` 配置：
+
+| 模式 | hash 内容 | 命中率 | 说明 |
+|------|-----------|--------|------|
+| `prefix` | system + 最后一条 user 消息 + tools + model | 高 | 同一问题在不同对话轮次都能命中 |
+| `full` | 整个请求体 (不含 stream/temperature 等) | 低 | 精确匹配，只有完全相同的请求才命中 |
+| `none` | 不缓存 | 0 | 直接关掉 |
+
+### token 一致性
+
+不同提供商 (OpenAI / DeepSeek / 通义千问) 的 token 计数不一样。缓存命中时自动把 token 数清零，不会返回旧提供商的错误数据。
+
+### 缓存管理 API
+
+```bash
+# 查看统计
+curl http://localhost:8080/cache/stats
+
+# 清空所有缓存
+curl -X POST http://localhost:8080/cache/clear
+
+# 只清过期的
+curl -X POST http://localhost:8080/cache/clear-expired
+```
 
 ## 文件结构
 
@@ -159,6 +197,7 @@ model:             model:
 .
 ├── .env.example       # 环境变量模板
 ├── .env               # 实际配置 (cp .env.example .env 后编辑)
+├── cache.py           # SQLite 缓存层 (响应 + 流式)
 ├── converter.py       # Anthropic ↔ OpenAI 格式转换
 ├── server.py          # FastAPI 代理服务 (含 CLI + 配置 + 伪装)
 ├── start.bat          # Windows 启动脚本
@@ -191,6 +230,9 @@ ccf
 | GET | `/v1/models` | 模型列表 (兼容性) |
 | GET | `/health` | 健康检查 |
 | GET | `/` | 服务信息和运行状态 |
+| GET | `/cache/stats` | 缓存统计信息 |
+| POST | `/cache/clear` | 清空所有缓存 |
+| POST | `/cache/clear-expired` | 只清过期的缓存 |
 
 ## 配置说明
 
@@ -207,6 +249,10 @@ ccf
 | `PROXY_HOST` | 代理监听地址 | 否 (默认 0.0.0.0) |
 | `PROXY_PORT` | 代理监听端口 | 否 (默认 8080) |
 | `ANTHROPIC_API_KEY` | 代理鉴权密钥 (留空跳过) | 否 |
+| `CACHE_ENABLED` | 启用缓存 (true/false) | 否 (默认 false) |
+| `CACHE_KEY_MODE` | 缓存 key 模式 (prefix/full/none) | 否 (默认 prefix) |
+| `CACHE_TTL` | 缓存过期秒数 | 否 (默认 3600) |
+| `CACHE_DIR` | 缓存数据库目录 | 否 (默认 .cache) |
 | `LOG_LEVEL` | 日志级别 | 否 (默认 info) |
 
 ### 自动读取 `~/.claude/settings.json`

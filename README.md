@@ -154,6 +154,44 @@ For detailed flow, see [docs/disguise-flow.md](./docs/disguise-flow.md).
 - [x] Proxy authentication (optional)
 - [x] Image input (base64 / URL)
 - [x] Auto-disguise from `~/.claude/settings.json`
+- [x] SQLite response cache (non-stream + streaming)
+- [x] Token auto-reset on cache hit (cross-provider safe)
+- [x] Cache management API (stats/clear/clear-expired)
+
+## Cache System
+
+SQLite-backed response cache with two modes for non-streaming and streaming.
+
+### Why Cache Matters
+
+Claude Code sends the full conversation history every turn. If you hash the entire request body, you almost never get a cache hit (was only 3% before). The `prefix` mode fixes this by only hashing the system prompt + last user message + tools, ignoring conversation history.
+
+### Cache Key Modes
+
+Configure via `CACHE_KEY_MODE`:
+
+| Mode | What Gets Hashed | Hit Rate | Notes |
+|------|-----------------|----------|-------|
+| `prefix` | system + last user message + tools + model | High | Same question across different turns hits cache |
+| `full` | Entire request body (excl. stream/temperature etc.) | Low | Exact match only |
+| `none` | Disabled | 0 | No caching |
+
+### Token Consistency
+
+Different providers (OpenAI, DeepSeek, Qwen) count tokens differently. On cache hit, token counts are automatically zeroed out so you never get stale provider data.
+
+### Cache Management API
+
+```bash
+# View stats
+curl http://localhost:8080/cache/stats
+
+# Clear all cache
+curl -X POST http://localhost:8080/cache/clear
+
+# Clear expired only
+curl -X POST http://localhost:8080/cache/clear-expired
+```
 
 ## Project Structure
 
@@ -161,6 +199,7 @@ For detailed flow, see [docs/disguise-flow.md](./docs/disguise-flow.md).
 .
 ├── .env.example           # Environment variable template
 ├── .env                   # Actual config (after cp .env.example .env)
+├── cache.py               # SQLite cache layer (response + streaming)
 ├── converter.py           # Anthropic ↔ OpenAI format conversion
 ├── server.py              # FastAPI proxy server (CLI + config + disguise)
 ├── start.bat              # Windows startup script
@@ -193,6 +232,9 @@ This installs the `ccf` command globally and opens the project page in browser.
 | GET | `/v1/models` | Model list (for compatibility) |
 | GET | `/health` | Health check |
 | GET | `/` | Service info and status |
+| GET | `/cache/stats` | Cache statistics |
+| POST | `/cache/clear` | Clear all cache entries |
+| POST | `/cache/clear-expired` | Clear only expired entries |
 
 ## Configuration
 
@@ -209,6 +251,10 @@ This installs the `ccf` command globally and opens the project page in browser.
 | `PROXY_HOST` | Proxy listen address | No (default: 0.0.0.0) |
 | `PROXY_PORT` | Proxy listen port | No (default: 8080) |
 | `ANTHROPIC_API_KEY` | Proxy auth key (empty to skip) | No |
+| `CACHE_ENABLED` | Enable cache (true/false) | No (default: false) |
+| `CACHE_KEY_MODE` | Cache key mode (prefix/full/none) | No (default: prefix) |
+| `CACHE_TTL` | Cache TTL in seconds | No (default: 3600) |
+| `CACHE_DIR` | Cache database directory | No (default: .cache) |
 | `LOG_LEVEL` | Log level | No (default: info) |
 
 ### Auto-read from `~/.claude/settings.json`
