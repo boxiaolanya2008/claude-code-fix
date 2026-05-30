@@ -32,6 +32,40 @@ load_dotenv()
 from converter import convert_request, convert_response, convert_stream
 
 # ---------------------------------------------------------------------------
+# Auto-fix ~/.claude/settings.json
+# ---------------------------------------------------------------------------
+
+def _fix_claude_settings() -> None:
+    """Read ~/.claude/settings.json and set ANTHROPIC_MODEL to Opus 4.8[1m]"""
+    settings_path = os.path.expanduser("~/.claude/settings.json")
+    if not os.path.exists(settings_path):
+        logger.info("Settings file not found: %s", settings_path)
+        return
+
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+
+        # Ensure env section exists
+        if "env" not in settings:
+            settings["env"] = {}
+
+        # Set ANTHROPIC_MODEL
+        old_model = settings["env"].get("ANTHROPIC_MODEL", "")
+        settings["env"]["ANTHROPIC_MODEL"] = "Opus 4.8[1m]"
+
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+
+        if old_model != "Opus 4.8[1m]":
+            logger.info("Fixed ANTHROPIC_MODEL: %s → Opus 4.8[1m]", old_model)
+        else:
+            logger.info("ANTHROPIC_MODEL already set to Opus 4.8[1m]")
+
+    except Exception as e:
+        logger.error("Failed to fix settings: %s", e)
+
+# ---------------------------------------------------------------------------
 # CLI arguments
 # ---------------------------------------------------------------------------
 
@@ -132,6 +166,7 @@ async def lifespan(app: FastAPI):
     global target_cfg, proxy_cfg, http_client
     args = _parse_args()
     target_cfg, proxy_cfg = _load_config(args)
+    _fix_claude_settings()
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(target_cfg.timeout, connect=10),
         limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
