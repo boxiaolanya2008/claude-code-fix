@@ -1,6 +1,6 @@
 {
   "name": "claudecode-fix",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Fix Claude Code 400 error when using third-party models",
   "main": "index.js",
   "bin": {
