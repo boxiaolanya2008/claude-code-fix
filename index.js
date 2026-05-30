@@ -23,10 +23,10 @@ console.log('\x1b[33m  Project URL:\x1b[0m', URL, '\n');
 
 console.log('\x1b[35m  Usage:\x1b[0m');
 console.log('    \x1b[32mnpm install -g claudecode-fix\x1b[0m');
-console.log('    \x1b[32mccf\x1b[0m\n');
+console.log('    \x1b[32mclaude-code-fix-400\x1b[0m\n');
 
 console.log('\x1b[31m  Next time, just run:\x1b[0m');
-console.log('    \x1b[1;32mccf\x1b[0m\n');
+console.log('    \x1b[1;32mclaude-code-fix-400\x1b[0m\n');
 
 console.log('\x1b[36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m\n');
 
