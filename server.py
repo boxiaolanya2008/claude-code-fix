@@ -89,13 +89,45 @@ def _env(key: str, default: str = "") -> str:
     return os.getenv(key, default).strip()
 
 
+def _read_settings_env(key: str) -> str:
+    """Read a key from the env section of ~/.claude/settings.json."""
+    settings_path = os.path.expanduser("~/.claude/settings.json")
+    if not os.path.exists(settings_path):
+        return ""
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        return settings.get("env", {}).get(key, "").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_disguise_model() -> str:
+    """Resolve disguise model: DISGUISE_MODEL env > settings.json ANTHROPIC_MODEL > empty."""
+    env_val = _env("DISGUISE_MODEL")
+    if env_val:
+        return env_val
+    return _read_settings_env("ANTHROPIC_MODEL")
+
+
+def _resolve_disguise_api_base() -> str:
+    """Resolve disguise API base: DISGUISE_API_BASE env > settings.json ANTHROPIC_BASE_URL > default."""
+    env_val = _env("DISGUISE_API_BASE")
+    if env_val:
+        return env_val
+    settings_val = _read_settings_env("ANTHROPIC_BASE_URL")
+    if settings_val:
+        return settings_val
+    return "https://api.anthropic.com"
+
+
 @dataclass(frozen=True)
 class TargetConfig:
     api_key: str   = _field(default_factory=lambda: _env("TARGET_API_KEY"))
     api_base: str  = _field(default_factory=lambda: _env("TARGET_API_BASE", "https://api.openai.com/v1"))
     model: str     = _field(default_factory=lambda: _env("TARGET_MODEL", "gpt-4o"))
-    disguise_model: str = _field(default_factory=lambda: _env("DISGUISE_MODEL"))
-    disguise_api_base: str = _field(default_factory=lambda: _env("DISGUISE_API_BASE", "https://api.anthropic.com"))
+    disguise_model: str = _field(default_factory=_resolve_disguise_model)
+    disguise_api_base: str = _field(default_factory=_resolve_disguise_api_base)
     max_retries: int = _field(default_factory=lambda: int(_env("TARGET_MAX_RETRIES", "2")))
     timeout: float = _field(default_factory=lambda: float(_env("TARGET_TIMEOUT", "300")))
 
@@ -245,6 +277,10 @@ async def handle_messages(request: Request):
     logger.debug("[%s] RAW BODY: %s", req_id[:12], _json.dumps(body, ensure_ascii=False)[:2000])
 
     oa_body = convert_request(body, target_cfg.model)
+
+    # Attach disguise values using Anthropic official keys
+    oa_body["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
+    oa_body["ANTHROPIC_MODEL"] = target_cfg.disguise_model
 
     # Debug: log converted request
     logger.debug("[%s] OA BODY: %s", req_id[:12], _json.dumps(oa_body, ensure_ascii=False)[:2000])
