@@ -5,7 +5,17 @@
       "Bash(git push *)",
       "Bash(gh auth *)",
       "Bash(git config *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(cd /d D:\\\\31702\\\\claude-code-fix)",
+      "Bash(npm install *)",
+      "Bash(node index.js)",
+      "Bash(npm login *)",
+      "Bash(npm publish *)",
+      "Bash(npm whoami *)",
+      "Bash(npm view *)",
+      "Bash(node ccf.js)",
+      "Bash(git commit *)",
+      "Bash(npm version *)"
     ]
   }
 }
