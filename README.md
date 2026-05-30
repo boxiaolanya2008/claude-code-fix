@@ -157,6 +157,7 @@ For detailed flow, see [docs/disguise-flow.md](./docs/disguise-flow.md).
 - [x] SQLite response cache (non-stream + streaming)
 - [x] Token auto-reset on cache hit (cross-provider safe)
 - [x] Cache management API (stats/clear/clear-expired)
+- [x] Web dashboard (real-time cache hit monitoring)
 
 ## Cache System
 
@@ -193,15 +194,30 @@ curl -X POST http://localhost:8080/cache/clear
 curl -X POST http://localhost:8080/cache/clear-expired
 ```
 
+### Web Dashboard
+
+Open `http://localhost:8080/dashboard` after starting the proxy:
+
+- Summary cards: total requests, hit rate, avg response time, cache entries
+- Stacked bar + line chart (30Min / 1H / 6H / 1D / 7D time ranges)
+- Breakdown by cache type (response vs streaming)
+- Live event feed (auto-refreshes every 3 seconds)
+- Chinese/English toggle (top-right CN/EN buttons, saves preference)
+
+Analytics data is stored in `.cache/analytics.db`, separate from the cache itself.
+
 ## Project Structure
 
 ```
 .
 ├── .env.example           # Environment variable template
 ├── .env                   # Actual config (after cp .env.example .env)
+├── analytics.py           # Cache analytics DB (separate from cache)
 ├── cache.py               # SQLite cache layer (response + streaming)
 ├── converter.py           # Anthropic ↔ OpenAI format conversion
 ├── server.py              # FastAPI proxy server (CLI + config + disguise)
+├── static/
+│   └── dashboard.html     # Monitoring dashboard page
 ├── start.bat              # Windows startup script
 ├── claude-settings-example.json  # Claude Code settings example
 ├── docs/
@@ -235,6 +251,10 @@ This installs the `ccf` command globally and opens the project page in browser.
 | GET | `/cache/stats` | Cache statistics |
 | POST | `/cache/clear` | Clear all cache entries |
 | POST | `/cache/clear-expired` | Clear only expired entries |
+| GET | `/dashboard` | Cache monitoring dashboard (Web UI) |
+| GET | `/dashboard/summary` | Dashboard summary data |
+| GET | `/dashboard/trend` | Hit rate trend data |
+| GET | `/dashboard/events` | Recent cache events |
 
 ## Configuration
 

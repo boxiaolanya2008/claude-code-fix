@@ -15,7 +15,26 @@
       "Bash(npm view *)",
       "Bash(node ccf.js)",
       "Bash(git commit *)",
-      "Bash(npm version *)"
+      "Bash(npm version *)",
+      "Bash(rm -f .cache/analytics.db .cache/responses.db)",
+      "Bash(ANTHROPIC_API_KEY='' python -c ' *)",
+      "Bash(kill %1)",
+      "WebSearch",
+      "WebFetch(domain:docs.portkey.ai)",
+      "WebFetch(domain:docs.litellm.ai)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:platform.openai.com)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "Bash(curl -s -X POST http://localhost:8080/v1/messages -H \"Content-Type: application/json\" -d \"{\\\\\"model\\\\\":\\\\\"claude-opus-4.8\\\\\",\\\\\"max_tokens\\\\\":100,\\\\\"messages\\\\\":[{\\\\\"role\\\\\":\\\\\"user\\\\\",\\\\\"content\\\\\":\\\\\"说hello\\\\\"}],\\\\\"stream\\\\\":false}\")",
+      "Bash(curl -s -X POST http://localhost:8080/v1/messages -H \"Content-Type: application/json\" -d \"{\\\\\"model\\\\\":\\\\\"claude-opus-4.8\\\\\",\\\\\"max_tokens\\\\\":100,\\\\\"messages\\\\\":[{\\\\\"role\\\\\":\\\\\"user\\\\\",\\\\\"content\\\\\":\\\\\"说hello\\\\\"}],\\\\\"stream\\\\\":false}\" -D -)",
+      "Bash(curl -s -N -X POST http://localhost:8080/v1/messages -H \"Content-Type: application/json\" -d \"{\\\\\"model\\\\\":\\\\\"claude-opus-4.8\\\\\",\\\\\"max_tokens\\\\\":100,\\\\\"messages\\\\\":[{\\\\\"role\\\\\":\\\\\"user\\\\\",\\\\\"content\\\\\":\\\\\"说hi\\\\\"}],\\\\\"stream\\\\\":true}\" -D -)",
+      "Bash(curl -s -X POST \"http://localhost:8080/v1/messages\" -H \"Content-Type: application/json\" -d '{\"model\":\"claude-opus-4.8\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}],\"stream\":false}' -D /dev/stderr)",
+      "Bash(curl -s -D - -X POST \"http://localhost:8080/v1/messages\" -H \"Content-Type: application/json\" -d '{\"model\":\"claude-opus-4.8\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"test123\"}],\"stream\":false}')",
+      "Bash(curl -s -X POST \"http://localhost:8080/v1/messages\" -H \"Content-Type: application/json\" -d '{\"model\":\"claude-opus-4.8\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}],\"stream\":false}')",
+      "Bash(curl -s http://localhost:8080/debug/last-request)",
+      "Bash(curl -s http://localhost:8080/health)"
     ]
   }
 }

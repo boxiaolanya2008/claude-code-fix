@@ -15,24 +15,17 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 import httpx
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 load_dotenv()
 
 from converter import convert_request, convert_response, convert_stream
-from cache import init_caches, get_response_cache, get_streaming_cache, extract_upstream_cache_info
-
-try:
-    from analytics import init_analytics, record_event, get_summary, get_trend, get_recent
-except ImportError:
-    init_analytics = record_event = get_summary = get_trend = get_recent = None
 
 
 # 启动时修 settings.json，确保 ANTHROPIC_MODEL 是对的
@@ -187,15 +180,12 @@ http_client: httpx.AsyncClient
 # 流式请求用线程池同步读上游，绕过 async httpx 的各种坑
 token_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="token-receiver")
 
-response_cache = None
-streaming_cache = None
-
 
 # 生命周期
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global target_cfg, proxy_cfg, http_client, response_cache, streaming_cache
+    global target_cfg, proxy_cfg, http_client
     args = _parse_args()
     target_cfg, proxy_cfg = _load_config(args)
     _fix_claude_settings()
@@ -204,14 +194,10 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
         verify=False,
     )
-    response_cache, streaming_cache = init_caches()
-    if init_analytics:
-        init_analytics()
-    cache_st = "开了" if response_cache and response_cache.enabled else "没开"
     logger.info(
-        "代理就绪  %s:%s  →  %s  model=%s  disguise=%s  cache=%s",
+        "代理就绪  %s:%s  →  %s  model=%s  disguise=%s",
         proxy_cfg.host, proxy_cfg.port, target_cfg.api_base,
-        target_cfg.model, target_cfg.disguise_model, cache_st,
+        target_cfg.model, target_cfg.disguise_model,
     )
     yield
     await http_client.aclose()
@@ -270,7 +256,13 @@ async def handle_messages(request: Request):
     req_id = f"msg_{uuid.uuid4().hex[:24]}"
     stream = body.get("stream", False)
 
-    logger.debug("[%s] 原始请求: %s", req_id[:12], json.dumps(body, ensure_ascii=False)[:2000])
+    # 调试：把原始请求体存到文件，方便和 curl 对比
+    _dump_path = os.path.join(os.path.dirname(__file__), ".cache", "last_request.json")
+    try:
+        with open(_dump_path, "w", encoding="utf-8") as _f:
+            json.dump(body, _f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
 
     # Anthropic → OpenAI 格式
     oa_body = convert_request(body, target_cfg.model)
@@ -295,36 +287,15 @@ async def handle_messages(request: Request):
         target_cfg.model, target_cfg.disguise_model, stream,
     )
 
-    # 非流式才走缓存
-    cache = get_response_cache()
-    if cache and not stream:
-        cached_resp, time_saved = cache.get(body, target_cfg.model)
-        if cached_resp:
-            logger.info("[%s] 缓存命中，省了 %dms", req_id[:12], time_saved)
-            if record_event:
-                record_event("response", True, time_saved, target_cfg.model, cache._gen_key(body, target_cfg.model))
-            anthropic_resp = convert_response(cached_resp, target_cfg.disguise_model, request_id=req_id)
-            return JSONResponse(anthropic_resp, headers={
-                "x-request-id": req_id,
-                "anthropic-version": "2023-06-01",
-                "x-cache-hit": "true",
-                "x-response-time-saved-ms": str(time_saved),
-                "x-tokens-reset": "true",
-            })
-
-    # 走到这里说明缓存没命中或缓存关了，记录 miss
-    if record_event:
-        record_event("response", False, 0, target_cfg.model, "")
-
     if stream:
-        return await _handle_stream(req_id, oa_body, headers, body)
+        return await _handle_stream(req_id, oa_body, headers)
     else:
-        return await _handle_non_stream(req_id, oa_body, headers, body)
+        return await _handle_non_stream(req_id, oa_body, headers)
 
 
 # 非流式处理
 
-async def _handle_non_stream(req_id, oa_body, headers, original_body):
+async def _handle_non_stream(req_id, oa_body, headers):
     try:
         resp = await http_client.post(target_cfg.chat_url, json=oa_body, headers=headers)
     except httpx.HTTPError as exc:
@@ -349,21 +320,6 @@ async def _handle_non_stream(req_id, oa_body, headers, original_body):
     except Exception:
         return _upstream_error("上游返回的不是 JSON")
 
-    # 追踪上游缓存指标
-    upstream_info = extract_upstream_cache_info(oa_resp)
-    if upstream_info["cached_tokens"] > 0:
-        logger.info(
-            "[%s] 上游缓存命中: %d/%d tokens (%.0f%%)",
-            req_id[:12], upstream_info["cached_tokens"],
-            upstream_info["total_input_tokens"],
-            upstream_info["cache_ratio"] * 100,
-        )
-
-    # 存缓存
-    cache = get_response_cache()
-    if cache:
-        cache.set(original_body, target_cfg.model, oa_resp)
-
     anthropic_resp = convert_response(oa_resp, target_cfg.disguise_model, request_id=req_id)
     return JSONResponse(anthropic_resp, headers={
         "x-request-id": req_id,
@@ -373,50 +329,10 @@ async def _handle_non_stream(req_id, oa_body, headers, original_body):
 
 # 流式处理
 
-async def _handle_stream(req_id, oa_body, headers, original_body):
-    # 流式缓存
-    cache = get_streaming_cache()
-    if cache:
-        cached_events, time_saved = cache.get_events(original_body, target_cfg.model)
-        if cached_events:
-            logger.info("[%s] 流式缓存命中，省了 %dms", req_id[:12], time_saved)
-            if record_event:
-                record_event("streaming", True, time_saved, target_cfg.model, cache._gen_key(original_body, target_cfg.model))
-
-            async def cached_sse_generator():
-                # 模拟真实生成节奏，避免客户端因秒回而行为异常
-                import asyncio as _aio
-                for ev in cached_events:
-                    yield ev
-                    # content_block_delta 之间加微延迟，模拟打字效果
-                    if "content_block_delta" in ev:
-                        await _aio.sleep(0.02)
-                    elif "content_block_start" in ev or "content_block_stop" in ev:
-                        await _aio.sleep(0.01)
-
-            return StreamingResponse(
-                cached_sse_generator(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                    "x-request-id": req_id,
-                    "anthropic-version": "2023-06-01",
-                    "x-cache-hit": "true",
-                    "x-response-time-saved-ms": str(time_saved),
-                    "x-tokens-reset": "true",
-                },
-            )
-
-    # 流式缓存没命中，记录 miss
-    if record_event:
-        record_event("streaming", False, 0, target_cfg.model, "")
-
+async def _handle_stream(req_id, oa_body, headers):
     # 线程池同步读上游，通过 Queue 传给 async
     queue: asyncio.Queue[str | None] = asyncio.Queue()
     loop = asyncio.get_event_loop()
-    collected_events: list[str] = []
 
     def read_upstream():
         """同步读上游 SSE 流，读完线程自动退出。"""
@@ -470,17 +386,22 @@ async def _handle_stream(req_id, oa_body, headers, original_body):
                         break
                     yield line
 
+            # 用单个生成器读所有行，避免两个生成器竞争同一个 queue
+            upstream_gen = raw_upstream_lines()
+
             # 先拿第一行，判断是正常还是出错
             first_line = None
-            async for line in raw_upstream_lines():
-                first_line = line
-                break
+            try:
+                first_line = await upstream_gen.__anext__()
+            except StopAsyncIteration:
+                pass
 
             if first_line is None:
                 yield _sse("error", {
                     "type": "error",
                     "error": {"type": "api_error", "message": "上游返回空响应"},
                 })
+                await upstream_gen.aclose()
                 return
 
             error_msg = _is_error(first_line)
@@ -493,43 +414,22 @@ async def _handle_stream(req_id, oa_body, headers, original_body):
                     "type": "error",
                     "error": {"type": "api_error", "message": error_msg},
                 })
+                await upstream_gen.aclose()
                 return
 
-            # 正常流，把第一行塞回去继续转
+            # 正常流：先 yield 第一行，再 async for 剩余行（同一个生成器，不会竞争 queue）
             async def replay():
                 yield first_line
-                async for line in raw_upstream_lines():
+                async for line in upstream_gen:
                     yield line
 
             async for event in convert_stream(replay(), target_cfg.disguise_model, request_id=req_id):
-                collected_events.append(event)
                 yield event
         finally:
             try:
                 future.result(timeout=5)
             except Exception:
                 pass
-            # 流结束存缓存
-            if collected_events:
-                cache = get_streaming_cache()
-                if cache:
-                    cache.set_events(original_body, target_cfg.model, collected_events)
-                # 从最后一个 chunk 提取上游缓存指标
-                for ev in reversed(collected_events):
-                    if "message_delta" in ev and "usage" in ev:
-                        try:
-                            start = ev.find("data: ") + 6
-                            end = ev.find("\n\n", start)
-                            if end == -1:
-                                end = len(ev)
-                            delta_obj = json.loads(ev[start:end])
-                            upstream_usage = delta_obj.get("usage", {})
-                            cached = upstream_usage.get("cached_tokens", 0)
-                            if cached > 0:
-                                logger.info("[%s] 上游流式缓存命中: %d tokens", req_id[:12], cached)
-                        except Exception:
-                            pass
-                        break
 
     return StreamingResponse(
         sse_generator(),
@@ -559,82 +459,22 @@ async def handle_models():
     }
 
 
-# 健康检查和缓存管理
+# 健康检查
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-@app.get("/cache/stats")
-async def cache_stats():
-    rc = get_response_cache()
-    sc = get_streaming_cache()
-    return {
-        "response_cache": rc.stats() if rc else {"enabled": False},
-        "streaming_cache": sc.stats() if sc else {"enabled": False},
-    }
-
-
-@app.post("/cache/clear")
-async def cache_clear():
-    """全清。"""
-    rc = get_response_cache()
-    sc = get_streaming_cache()
-    res = {}
-    if rc:
-        res["response_cache_cleared"] = rc.clear_all()
-    if sc:
-        res["streaming_cache_cleared"] = sc.clear_all()
-    return {"status": "ok", "cleared": res}
-
-
-@app.post("/cache/clear-expired")
-async def cache_clear_expired():
-    """只清过期的。"""
-    rc = get_response_cache()
-    sc = get_streaming_cache()
-    res = {}
-    if rc:
-        res["response_cache_evicted"] = rc.clear_expired()
-    if sc:
-        res["streaming_cache_evicted"] = sc.clear_expired()
-    return {"status": "ok", "evicted": res}
-
-
-# 仪表盘
-
-@app.get("/dashboard")
-async def dashboard():
-    """缓存监控仪表盘。"""
-    if not get_summary:
-        return HTMLResponse("<h1>analytics 模块未安装</h1>", status_code=503)
-    html_path = os.path.join(os.path.dirname(__file__), "static", "dashboard.html")
-    if not os.path.exists(html_path):
-        return HTMLResponse("<h1>仪表盘文件不存在</h1>", status_code=404)
-    with open(html_path, encoding="utf-8") as f:
-        return HTMLResponse(f.read())
-
-
-@app.get("/dashboard/summary")
-async def dashboard_summary():
-    if not get_summary:
-        return {"error": "analytics not available"}
-    return get_summary()
-
-
-@app.get("/dashboard/trend")
-async def dashboard_trend(seconds: int = 3600, bucket: int = 60):
-    if not get_trend:
-        return []
-    return get_trend(seconds=seconds, bucket=bucket)
-
-
-@app.get("/dashboard/events")
-async def dashboard_events(limit: int = 50):
-    if not get_recent:
-        return []
-    return get_recent(limit=limit)
+@app.get("/debug/last-request")
+async def debug_last_request():
+    """返回最近一次请求的原始 body，调试用。"""
+    dump_path = os.path.join(os.path.dirname(__file__), ".cache", "last_request.json")
+    try:
+        with open(dump_path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"error": "no request captured yet"}
 
 
 @app.get("/")
