@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 load_dotenv()
 
 from converter import convert_request, convert_response, convert_stream
+from cache import init_caches, get_response_cache, get_streaming_cache
 
 # ---------------------------------------------------------------------------
 # Auto-fix ~/.claude/settings.json
@@ -192,10 +193,14 @@ http_client: httpx.AsyncClient
 # 多线程接收 token 的线程池
 token_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="token-receiver")
 
+# Cache instances
+response_cache = None
+streaming_cache = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global target_cfg, proxy_cfg, http_client
+    global target_cfg, proxy_cfg, http_client, response_cache, streaming_cache
     args = _parse_args()
     target_cfg, proxy_cfg = _load_config(args)
     _fix_claude_settings()
@@ -204,9 +209,12 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
         verify=False,
     )
+    # Initialize caches
+    response_cache, streaming_cache = init_caches()
     logger.info(
-        "Proxy ready  %s:%s  →  %s  model=%s  disguise=%s",
+        "Proxy ready  %s:%s  →  %s  model=%s  disguise=%s  cache=%s",
         proxy_cfg.host, proxy_cfg.port, target_cfg.api_base, target_cfg.model, target_cfg.disguise_model,
+        "enabled" if response_cache and response_cache.enabled else "disabled",
     )
     yield
     await http_client.aclose()
@@ -294,7 +302,6 @@ async def handle_messages(request: Request):
     if v := request.headers.get("anthropic-version"):
         headers["anthropic-version"] = v
 
-        verify=False,
     logger.info(
         "[%s] %s → %s  disguise=%s  (stream=%s)",
         req_id[:12],
@@ -304,15 +311,32 @@ async def handle_messages(request: Request):
         stream,
     )
 
+    # Check cache first (non-streaming only)
+    cache = get_response_cache()
+    if cache and not stream:
+        cached_resp, time_saved = cache.get(body, target_cfg.model)
+        if cached_resp:
+            logger.info(
+                "[%s] CACHE HIT → served from cache (saved ~%dms)",
+                req_id[:12], time_saved,
+            )
+            anthropic_resp = convert_response(cached_resp, target_cfg.disguise_model, request_id=req_id)
+            return JSONResponse(anthropic_resp, headers={
+                "x-request-id": req_id,
+                "anthropic-version": "2023-06-01",
+                "x-cache-hit": "true",
+                "x-response-time-saved-ms": str(time_saved),
+            })
+
     if stream:
-        return await _handle_stream(req_id, oa_body, headers)
+        return await _handle_stream(req_id, oa_body, headers, body)
     else:
-        return await _handle_non_stream(req_id, oa_body, headers)
+        return await _handle_non_stream(req_id, oa_body, headers, body)
 
 
 # ---- non-streaming -------------------------------------------------------
 
-async def _handle_non_stream(req_id: str, oa_body: dict, headers: dict) -> Response:
+async def _handle_non_stream(req_id: str, oa_body: dict, headers: dict, original_body: dict) -> Response:
     try:
         resp = await http_client.post(target_cfg.chat_url, json=oa_body, headers=headers)
     except httpx.HTTPError as exc:
@@ -337,6 +361,11 @@ async def _handle_non_stream(req_id: str, oa_body: dict, headers: dict) -> Respo
     except Exception:
         return _upstream_error("Invalid JSON from upstream")
 
+    # Cache the response for future requests
+    cache = get_response_cache()
+    if cache:
+        cache.set(original_body, target_cfg.model, oa_resp)
+
     anthropic_resp = convert_response(oa_resp, target_cfg.disguise_model, request_id=req_id)
     return JSONResponse(anthropic_resp, headers={
         "x-request-id": req_id,
@@ -346,10 +375,37 @@ async def _handle_non_stream(req_id: str, oa_body: dict, headers: dict) -> Respo
 
 # ---- streaming -----------------------------------------------------------
 
-async def _handle_stream(req_id: str, oa_body: dict, headers: dict) -> StreamingResponse:
+async def _handle_stream(req_id: str, oa_body: dict, headers: dict, original_body: dict) -> StreamingResponse:
+    # Check streaming cache first
+    cache = get_streaming_cache()
+    if cache:
+        cached_events, time_saved = cache.get_events(original_body, target_cfg.model)
+        if cached_events:
+            logger.info(
+                "[%s] STREAM CACHE HIT → served from cache (saved ~%dms)",
+                req_id[:12], time_saved,
+            )
+            async def cached_sse_generator() -> AsyncGenerator[str, None]:
+                for event_line in cached_events:
+                    yield event_line
+            return StreamingResponse(
+                cached_sse_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "x-request-id": req_id,
+                    "anthropic-version": "2023-06-01",
+                    "x-cache-hit": "true",
+                    "x-response-time-saved-ms": str(time_saved),
+                },
+            )
+
     # 在线程中使用同步 httpx.Client 发送流式请求
     queue: asyncio.Queue[str | None] = asyncio.Queue()
     loop = asyncio.get_event_loop()
+    collected_events: list[str] = []
 
     def read_upstream():
         """在线程中用同步 Client 读取上游数据，完成后自动废弃线程"""
@@ -437,12 +493,19 @@ async def _handle_stream(req_id: str, oa_body: dict, headers: dict) -> Streaming
                     yield line
 
             async for event in convert_stream(replay(), target_cfg.disguise_model, request_id=req_id):
+                collected_events.append(event)
                 yield event
         finally:
             try:
                 future.result(timeout=5)
             except Exception:
                 pass
+            # Cache the collected streaming events
+            if collected_events:
+                cache = get_streaming_cache()
+                if cache:
+                    cache.set_events(original_body, target_cfg.model, collected_events)
+                    logger.debug("[%s] Cached %d streaming events", req_id[:12], len(collected_events))
             logger.debug("[%s] token receiver thread completed and discarded", req_id[:12])
 
     return StreamingResponse(
@@ -484,6 +547,43 @@ async def handle_models():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/cache/stats")
+async def cache_stats():
+    """Return cache statistics for both response and streaming caches."""
+    resp_cache = get_response_cache()
+    stream_cache = get_streaming_cache()
+    return {
+        "response_cache": resp_cache.stats() if resp_cache else {"enabled": False},
+        "streaming_cache": stream_cache.stats() if stream_cache else {"enabled": False},
+    }
+
+
+@app.post("/cache/clear")
+async def cache_clear():
+    """Clear all cache entries (expired and active)."""
+    resp_cache = get_response_cache()
+    stream_cache = get_streaming_cache()
+    results = {}
+    if resp_cache:
+        results["response_cache_cleared"] = resp_cache.clear_all()
+    if stream_cache:
+        results["streaming_cache_cleared"] = stream_cache.clear_all()
+    return {"status": "ok", "cleared": results}
+
+
+@app.post("/cache/clear-expired")
+async def cache_clear_expired():
+    """Clear only expired cache entries."""
+    resp_cache = get_response_cache()
+    stream_cache = get_streaming_cache()
+    results = {}
+    if resp_cache:
+        results["response_cache_evicted"] = resp_cache.clear_expired()
+    if stream_cache:
+        results["streaming_cache_evicted"] = stream_cache.clear_expired()
+    return {"status": "ok", "evicted": results}
 
 
 @app.get("/")
